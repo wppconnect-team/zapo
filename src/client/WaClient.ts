@@ -711,7 +711,7 @@ export class WaClient extends EventEmitter {
 
     public async requestPairingCode(
         phoneNumber: string,
-        shouldShowPushNotification = false,
+        shouldShowPushNotification = true,
         customCode?: string
     ): Promise<string> {
         if (!this.connectionManager.isConnected() || !this.authClient.getCurrentCredentials()) {

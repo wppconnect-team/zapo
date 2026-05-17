@@ -268,7 +268,7 @@ export class WaAuthClient {
 
     public async requestPairingCode(
         phoneNumber: string,
-        shouldShowPushNotification = false,
+        shouldShowPushNotification = true,
         customCode?: string
     ): Promise<string> {
         this.requireCredentials()

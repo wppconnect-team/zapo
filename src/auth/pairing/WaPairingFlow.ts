@@ -92,7 +92,7 @@ export class WaPairingFlow {
 
     public async requestPairingCode(
         phoneNumber: string,
-        shouldShowPushNotification = false,
+        shouldShowPushNotification = true,
         customCode?: string
     ): Promise<string> {
         this.opts.logger.info('requesting pairing code', {
