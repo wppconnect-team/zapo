@@ -72,7 +72,13 @@ import {
     WA_NODE_TAGS,
     type WaBotMsgEditType
 } from '@protocol/constants'
-import { isBotJid, normalizeDeviceJid, parsePhoneJid, toUserJid } from '@protocol/jid'
+import {
+    applyDeviceToJid,
+    isBotJid,
+    normalizeDeviceJid,
+    parsePhoneJid,
+    toUserJid
+} from '@protocol/jid'
 import { WA_LOGOUT_REASONS, type WaLogoutReason } from '@protocol/stream'
 import type { SignalLidSyncResult } from '@signal/api/SignalDeviceSyncApi'
 import { NOOP_MESSAGE_SECRET_STORE } from '@store/noop.store'
@@ -453,8 +459,8 @@ export class WaClient extends EventEmitter {
             return
         }
 
-        const requesterRaw = event.senderJid ?? event.chatJid
-        if (!requesterRaw) {
+        const requesterSource = event.senderJid ?? event.chatJid
+        if (!requesterSource) {
             this.logger.warn('incoming app-state key request missing sender jid', {
                 id: event.stanzaId
             })
@@ -463,11 +469,14 @@ export class WaClient extends EventEmitter {
 
         let requesterDeviceJid: string
         try {
+            const requesterRaw = event.senderJid
+                ? applyDeviceToJid(event.senderJid, event.senderDevice)
+                : requesterSource
             requesterDeviceJid = normalizeDeviceJid(requesterRaw)
         } catch (error) {
             this.logger.warn('incoming app-state key request has malformed sender jid', {
                 id: event.stanzaId,
-                from: requesterRaw,
+                from: requesterSource,
                 message: toError(error).message
             })
             return
@@ -778,7 +787,9 @@ export class WaClient extends EventEmitter {
             return {
                 chatJid: event.chatJid,
                 id: event.stanzaId,
-                senderJid: event.senderJid,
+                senderJid: event.senderJid
+                    ? applyDeviceToJid(event.senderJid, event.senderDevice)
+                    : undefined,
                 isGroupChat: event.isGroupChat,
                 isBroadcastChat: event.isBroadcastChat
             }

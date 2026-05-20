@@ -3,6 +3,7 @@ import type { WaIncomingMessageEvent } from '@client/types'
 import type { Logger } from '@infra/log/types'
 import { needsSecretPersistence } from '@message/encode/content'
 import { proto } from '@proto'
+import { toUserJid } from '@protocol/jid'
 import type { WaMessageSecretStore } from '@store/contracts/message-secret.store'
 import { toError } from '@util/primitives'
 
@@ -19,7 +20,8 @@ function persistContacts(
     nowMs: number
 ): void {
     const senderJid = event.senderJid
-    const participantJid = event.rawNode.attrs.participant
+    const rawParticipant = event.rawNode.attrs.participant
+    const participantJid = rawParticipant ? toUserJid(rawParticipant) : undefined
     if (!senderJid && !participantJid) {
         return
     }
@@ -63,7 +65,8 @@ export function persistIncomingMailboxEntities(options: WaPersistIncomingMailbox
             event.message &&
             needsSecretPersistence(event.message)
         ) {
-            const senderJid = event.senderJid ?? event.rawNode.attrs.participant ?? ''
+            const rawSender = event.senderJid ?? event.rawNode.attrs.participant
+            const senderJid = rawSender ? toUserJid(rawSender) : ''
             void messageSecretStore
                 .set(stanzaId, { secret: rawSecret, senderJid })
                 .catch((error) => {

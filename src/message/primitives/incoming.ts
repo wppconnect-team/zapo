@@ -13,7 +13,9 @@ import {
     isBroadcastJid,
     isGroupJid,
     isNewsletterJid,
-    parseSignalAddressFromJid
+    parseJidFull,
+    parseSignalAddressFromJid,
+    toUserJid
 } from '@protocol/jid'
 import type { WaRetryDecryptFailureContext } from '@retry/types'
 import type { SenderKeyManager } from '@signal/group/SenderKeyManager'
@@ -37,6 +39,28 @@ interface WaIncomingMessageAckHandlerOptions {
     readonly emitIncomingMessage?: (event: WaIncomingMessageEvent) => void
     readonly emitNewsletterReaction?: (event: WaIncomingNewsletterReactionEvent) => void
     readonly emitUnhandledStanza?: (event: WaIncomingUnhandledStanzaEvent) => void
+}
+
+interface MessageIdentityAttrs {
+    readonly senderAlt: string | undefined
+    readonly senderUsername: string | undefined
+    readonly recipientJid: string | undefined
+    readonly recipientAlt: string | undefined
+    readonly pushName: string | undefined
+}
+
+function extractMessageIdentityAttrs(attrs: BinaryNode['attrs']): MessageIdentityAttrs {
+    const rawAlt =
+        attrs.participant_pn ?? attrs.sender_pn ?? attrs.participant_lid ?? attrs.sender_lid
+    const rawRecipientAlt = attrs.peer_recipient_pn ?? attrs.peer_recipient_lid
+    const rawRecipient = attrs.recipient
+    return {
+        senderAlt: rawAlt ? toUserJid(rawAlt) : undefined,
+        senderUsername: attrs.participant_username ?? attrs.username,
+        recipientJid: rawRecipient ? toUserJid(rawRecipient) : undefined,
+        recipientAlt: rawRecipientAlt ? toUserJid(rawRecipientAlt) : undefined,
+        pushName: attrs.notify
+    }
 }
 
 function pickNextRetryCount(node: BinaryNode): number {
@@ -94,7 +118,10 @@ export function buildRecoveredIncomingEvent(
     const participant = key.participant ?? undefined
     const isGroup = chatJid ? isGroupJid(chatJid) : false
     const isBroadcast = chatJid ? isBroadcastJid(chatJid) : false
-    const senderJid = fromMe ? undefined : isGroup || isBroadcast ? participant : chatJid
+    const rawSender = fromMe ? undefined : isGroup || isBroadcast ? participant : chatJid
+    const sender = rawSender ? parseJidFull(rawSender) : null
+    const senderJid = sender?.userJid
+    const senderDevice = sender?.address.device
     const timestampSeconds =
         webMessageInfo.messageTimestamp !== null && webMessageInfo.messageTimestamp !== undefined
             ? longToNumber(webMessageInfo.messageTimestamp)
@@ -114,6 +141,7 @@ export function buildRecoveredIncomingEvent(
         chatJid,
         timestampSeconds,
         senderJid,
+        senderDevice,
         encryptionType: 'placeholder_recovery',
         isGroupChat: isGroup,
         isBroadcastChat: isBroadcast,
@@ -277,13 +305,17 @@ function processMsmsgEncNode(
             }
         }
         const chatJid = node.attrs.from
+        const sender = senderJid ? parseJidFull(senderJid) : null
+        const identity = extractMessageIdentityAttrs(node.attrs)
         options.emitIncomingMessage?.({
             rawNode: buildIncomingEventRawNode(node),
             stanzaId: node.attrs.id,
             chatJid,
             stanzaType: node.attrs.type,
             timestampSeconds: parseOptionalInt(node.attrs.t),
-            senderJid,
+            senderJid: sender?.userJid,
+            senderDevice: sender?.address.device,
+            ...identity,
             encryptionType: 'msmsg',
             isGroupChat: chatJid ? isGroupJid(chatJid) : false,
             isBroadcastChat: chatJid ? isBroadcastJid(chatJid) : false,
@@ -351,13 +383,16 @@ async function decryptAndProcessEncNode(
         }
         if (shouldEmitIncomingMessage(message)) {
             const chatJid = node.attrs.from
+            const identity = extractMessageIdentityAttrs(node.attrs)
             options.emitIncomingMessage?.({
                 rawNode: buildIncomingEventRawNode(node),
                 stanzaId: node.attrs.id,
                 chatJid,
                 stanzaType: node.attrs.type,
                 timestampSeconds: parseOptionalInt(node.attrs.t),
-                senderJid,
+                senderJid: `${senderAddress.user}@${senderAddress.server}`,
+                senderDevice: senderAddress.device,
+                ...identity,
                 encryptionType: encType,
                 isGroupChat: chatJid ? isGroupJid(chatJid) : false,
                 isBroadcastChat: chatJid ? isBroadcastJid(chatJid) : false,
