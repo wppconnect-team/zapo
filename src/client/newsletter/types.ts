@@ -1,10 +1,17 @@
 import type { WaSendContextInfo } from '@message/context-info'
 import type { WaMessagePublishResult } from '@message/types'
+import type { WaMexOperationResponses } from '@mex'
 import type {
     WA_NEWSLETTER_VIEW_ROLES,
     WaNewsletterRole,
     WaNewsletterStateType
 } from '@protocol/newsletter'
+
+export type WaNewsletterCapability = NonNullable<
+    NonNullable<
+        WaMexOperationResponses['FetchNewsletterAdminCapabilities']['xwa2_newsletter_admin']
+    >['capabilities']
+>[number]
 
 export interface WaNewsletterPicture {
     readonly url?: string
@@ -84,7 +91,7 @@ export interface WaNewsletterDirectoryCategoriesPreviewOptions {
 
 export interface WaNewsletterCapabilityExposure {
     readonly newsletterJid: string
-    readonly capability: string
+    readonly capability: WaNewsletterCapability
 }
 
 export interface WaNewsletterCreateInput {
@@ -150,8 +157,6 @@ export interface WaNewsletterViewReceiptInput {
     readonly stanzaId?: string
 }
 
-export type WaNewsletterMexEnvelope = Readonly<Record<string, unknown>>
-
 export interface WaNewsletterAdminInfo {
     readonly adminCount?: number
     readonly adminProfile: WaNewsletterAdminProfile | null
@@ -183,7 +188,6 @@ export interface WaPageInfo {
 
 export interface WaNewsletterFollowersPage {
     readonly followers: readonly WaNewsletterFollower[]
-    readonly pageInfo?: WaPageInfo
 }
 
 export interface WaNewsletterDirectoryResults {
