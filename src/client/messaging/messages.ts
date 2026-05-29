@@ -427,10 +427,21 @@ function resolveUploadType(
     return content.type as MediaCryptoType
 }
 
-function resolveMimetype(content: Exclude<WaSendMediaMessage, WaSendStickerPackMessage>): string {
+async function resolveMimetype(
+    content: Exclude<WaSendMediaMessage, WaSendStickerPackMessage>,
+    media: WaMediaOptions | undefined,
+    processorInput: string | Uint8Array | undefined
+): Promise<string> {
     if (content.mimetype) return content.mimetype
     if (content.type === 'sticker') return 'image/webp'
-    throw new Error(`mimetype is required for ${content.type} messages`)
+    const detect = media?.processor?.detectMimetype
+    if (detect && processorInput !== undefined) {
+        const detected = await detect(processorInput)
+        if (detected) return detected
+    }
+    throw new Error(
+        `mimetype is required for ${content.type} messages (or configure a WaMediaProcessor with detectMimetype)`
+    )
 }
 
 async function buildMediaMessage(
@@ -455,10 +466,17 @@ async function buildMediaMessage(
             })
         }
     }
+    const needsMimetypeDetection =
+        !content.mimetype &&
+        content.type !== 'sticker' &&
+        !!options.media?.processor?.detectMimetype &&
+        isReadableStream(content.media)
     const needsTempFile =
         hasMediaProcessingTasks(options.media, content) ||
-        (content.type === 'sticker' && content.firstFrameLength === undefined)
+        (content.type === 'sticker' && content.firstFrameLength === undefined) ||
+        needsMimetypeDetection
     const resolved = await resolveMediaInputs(needsTempFile, content.media)
+    const mimetype = await resolveMimetype(content, options.media, resolved.processorInput)
 
     try {
         let detectedFirstFrameLength: number | undefined
@@ -478,8 +496,8 @@ async function buildMediaMessage(
                 : undefined
 
         const uploadPromise = isReadableStream(resolved.uploadMedia)
-            ? uploadMediaStream(options, content, resolved.uploadMedia, firstFrameLength)
-            : uploadMediaBytes(options, content, resolved.uploadMedia, firstFrameLength)
+            ? uploadMediaStream(options, content, resolved.uploadMedia, firstFrameLength, mimetype)
+            : uploadMediaBytes(options, content, resolved.uploadMedia, firstFrameLength, mimetype)
         const processPromise = runMediaProcessor(
             options.media,
             resolved.processorInput,
@@ -503,7 +521,7 @@ async function buildMediaMessage(
             fileEncSha256: uploaded.fileEncSha256,
             directPath: uploaded.directPath,
             mediaKeyTimestamp,
-            mimetype: resolveMimetype(content)
+            mimetype
         }
         const uploadSummary: WaMessageUploadInfo = {
             url: uploaded.url,
@@ -681,7 +699,8 @@ async function uploadMediaBytes(
     options: WaMediaMessageOptions,
     content: Exclude<WaSendMediaMessage, WaSendStickerPackMessage>,
     mediaBytes: Uint8Array,
-    firstFrameLength?: number
+    firstFrameLength: number | undefined,
+    mimetype: string
 ): Promise<UploadResult> {
     const uploadType = resolveUploadType(content)
     const mediaKey = await WaMediaCrypto.generateMediaKey()
@@ -710,7 +729,7 @@ async function uploadMediaBytes(
         method: 'POST',
         body: encrypted.ciphertextHmac,
         contentLength: encrypted.ciphertextHmac.byteLength,
-        contentType: resolveMimetype(content)
+        contentType: mimetype
     })
     const responseBody = await options.mediaTransfer.readResponseBytes(uploadResponse)
     const parsed = parseUploadResponse(responseBody, uploadResponse.status)
@@ -799,7 +818,8 @@ async function uploadMediaStream(
     options: WaMediaMessageOptions,
     content: Exclude<WaSendMediaMessage, WaSendStickerPackMessage>,
     stream: Readable,
-    firstFrameLength?: number
+    firstFrameLength: number | undefined,
+    mimetype: string
 ): Promise<UploadResult> {
     const cryptoType = resolveUploadType(content)
     return uploadEncryptedStream(options, {
@@ -807,7 +827,7 @@ async function uploadMediaStream(
         mediaKey: await WaMediaCrypto.generateMediaKey(),
         cryptoType,
         uploadPath: resolveUploadPath(cryptoType),
-        contentType: resolveMimetype(content),
+        contentType: mimetype,
         logLabel: 'sending media stream upload request',
         sidecar: needsSidecar(content),
         firstFrameLength
