@@ -310,6 +310,9 @@ export class WaMessageDispatchCoordinator {
             ])
         }
         let optionsCtx = options.contextInfo
+        if (options.expirationSeconds !== undefined) {
+            optionsCtx = { ...optionsCtx, expirationSeconds: options.expirationSeconds }
+        }
         if (
             isGroupJid(recipientJid) &&
             optionsCtx?.expirationSeconds === undefined &&
@@ -330,20 +333,32 @@ export class WaMessageDispatchCoordinator {
         })
         const withCtx = ctx ? applyContextInfo(built.message, ctx) : built.message
         const withViewOnce = options.viewOnce ? wrapAsViewOnce(withCtx) : withCtx
-        const message = options.editKey
+        const editKey = options.editKey
+        let editId: string | undefined
+        let editParticipant: string | undefined
+        let editTimestamp: number | undefined
+        if (editKey) {
+            if ('rawNode' in editKey) {
+                editId = editKey.key?.id ?? undefined
+                editParticipant = editKey.key?.participant ?? undefined
+            } else {
+                editId = editKey.id
+                editParticipant = editKey.participant
+                editTimestamp = 'timestampMs' in editKey ? editKey.timestampMs : undefined
+            }
+        }
+        const message: Proto.IMessage = editKey
             ? {
                   protocolMessage: {
                       type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
                       key: {
                           remoteJid: recipientJid,
                           fromMe: true,
-                          id: options.editKey.stanzaId,
-                          ...(options.editKey.participant
-                              ? { participant: options.editKey.participant }
-                              : {})
+                          id: editId,
+                          ...(editParticipant ? { participant: editParticipant } : {})
                       },
                       editedMessage: withViewOnce,
-                      timestampMs: options.editKey.timestampMs ?? Date.now()
+                      timestampMs: editTimestamp ?? Date.now()
                   }
               }
             : withViewOnce
@@ -405,7 +420,7 @@ export class WaMessageDispatchCoordinator {
         // omit enc.mediatype; sending type=media + mediatype=list/button alongside the
         // companion is rejected by the server as SMAX_INVALID (479).
         const type = buttonAddonKind ? 'text' : resolveMessageTypeAttr(messageWithIcdc)
-        const edit = resolveEditAttr(messageWithIcdc, sendOptions.subtype) ?? undefined
+        const edit = resolveEditAttr(messageWithIcdc) ?? undefined
         const mediatype = buttonAddonKind
             ? undefined
             : (resolveEncMediaType(messageWithIcdc) ?? undefined)
@@ -659,7 +674,7 @@ export class WaMessageDispatchCoordinator {
             type: resolveMessageTypeAttr(messageWithSecret),
             id: sendOptions.id,
             phash: extras.phash,
-            edit: resolveEditAttr(messageWithSecret, sendOptions.subtype) ?? undefined,
+            edit: resolveEditAttr(messageWithSecret) ?? undefined,
             mediatype: resolveEncMediaType(messageWithSecret) ?? undefined,
             decryptFail: resolveDecryptFailAttr(messageWithSecret),
             groupCiphertext: groupCiphertext.ciphertext,

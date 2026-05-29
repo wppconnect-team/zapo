@@ -21,7 +21,7 @@ export interface WaSendContextInfo {
 }
 
 export interface WaQuoteRef {
-    readonly stanzaId: string
+    readonly id: string
     readonly participant?: string
     readonly remoteJid?: string
     readonly message?: Proto.IMessage
@@ -86,6 +86,33 @@ export function applyContextInfo(
     return next
 }
 
+/**
+ * Reads the disappearing-message TTL (`contextInfo.expiration`) from the first
+ * submessage that carries it. Unwraps `ephemeralMessage` if present. Returns
+ * `undefined` when no submessage has an `expiration` set.
+ */
+export function pickIncomingExpirationSeconds(
+    message: Proto.IMessage | undefined
+): number | undefined {
+    if (!message) return undefined
+    const inner = message.ephemeralMessage?.message ?? message
+    for (const key of Object.keys(inner)) {
+        const value = (inner as Record<string, unknown>)[key]
+        if (
+            value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            !(value instanceof Uint8Array)
+        ) {
+            const ctx = (value as ContextInfoCarrier).contextInfo
+            if (ctx?.expiration !== undefined && ctx.expiration !== null) {
+                return ctx.expiration
+            }
+        }
+    }
+    return undefined
+}
+
 function pickContextInfoTarget(message: Proto.IMessage): ContextInfoCarrier | null {
     for (const key of Object.keys(message)) {
         const value = (message as Record<string, unknown>)[key]
@@ -101,14 +128,23 @@ function pickContextInfoTarget(message: Proto.IMessage): ContextInfoCarrier | nu
     return null
 }
 
-type WaQuoteSource =
-    | WaQuoteRef
-    | {
-          readonly stanzaId?: string
-          readonly chatJid?: string
-          readonly senderJid?: string
-          readonly message?: Proto.IMessage
-      }
+/**
+ * Anything that identifies a quoted message. Accepts a {@link WaQuoteRef}, a
+ * {@link WaMessageKey} (bare proto key), or a full incoming message event (its
+ * `key` + `message` are read). All fields are optional structurally — the
+ * public `quote` option type enforces the concrete shape.
+ */
+type WaQuoteSource = {
+    readonly key?: {
+        readonly id?: string
+        readonly remoteJid?: string
+        readonly participant?: string
+    }
+    readonly id?: string
+    readonly remoteJid?: string
+    readonly participant?: string
+    readonly message?: Proto.IMessage
+}
 
 type WaForwardSource = boolean | { readonly score?: number }
 
@@ -130,15 +166,9 @@ export function resolveSendContextInfo(input: WaSendContextResolveInput): WaSend
 
     if (input.quote) {
         const q = input.quote
-        ctx.quotedMessageId = q.stanzaId ?? ctx.quotedMessageId
-        ctx.quotedParticipant =
-            ('participant' in q ? q.participant : undefined) ??
-            ('senderJid' in q ? q.senderJid : undefined) ??
-            ctx.quotedParticipant
-        ctx.quotedRemoteJid =
-            ('remoteJid' in q ? q.remoteJid : undefined) ??
-            ('chatJid' in q ? q.chatJid : undefined) ??
-            ctx.quotedRemoteJid
+        ctx.quotedMessageId = q.id ?? q.key?.id ?? ctx.quotedMessageId
+        ctx.quotedParticipant = q.participant ?? q.key?.participant ?? ctx.quotedParticipant
+        ctx.quotedRemoteJid = q.remoteJid ?? q.key?.remoteJid ?? ctx.quotedRemoteJid
         ctx.quotedMessage = q.message ?? ctx.quotedMessage
     }
 
