@@ -1,28 +1,28 @@
 name: Publish @wppconnect/zapo
 
-# Publishes the ROOT package of this fork to npm as @wppconnect/zapo.
+# Publishes the ROOT package of this fork to npm as @wppconnect/zapo via OIDC
+# trusted publishing.
 #
-# NOTE: zapo is a monorepo (workspaces: packages/*). This workflow publishes
-# only the root client package (upstream name "zapo-js") under the scoped name
-# @wppconnect/zapo — that is what wppconnect-server consumes. The workspace
-# sub-packages (store-*, media-utils, ...) are NOT republished here; decide on
-# those separately if/when needed.
+# NOTE: zapo is a monorepo (workspaces: packages/*). Only the root client
+# package is published here (as @wppconnect/zapo) with --workspaces=false; the
+# sub-packages are not republished.
 #
-# The fork's package.json keeps the upstream name so the branch stays a faithful
-# mirror. The scoped name is applied ONLY here in the runner, right before
-# publishing — never committed.
+# WHY A `publish` BRANCH:
+# The default branch (master) stays a faithful mirror of upstream (vinikjkkj/
+# zapo) so rebasing/syncing is conflict-free. This `publish` branch is the ONLY
+# place package.json carries the scoped name + the fork's repository url — which
+# OIDC provenance REQUIRES to match the GitHub repo.
 #
-# Trigger: push a tag like `wpp-v0.3.0` (own prefix, never collides with the
-# upstream's tags).
+# FIRST PUBLISH IS MANUAL (see PUBLISHING.md). After the package exists on npm
+# and its Trusted Publisher is configured, pushing to `publish` publishes.
 #
-# Auth: OIDC trusted publishing (same model as wppconnect-team/wppconnect).
-# Configure a trusted publisher for @wppconnect/zapo in npm pointing at this
-# workflow. No NPM_TOKEN secret needed.
+# Auth: OIDC trusted publishing — no NPM_TOKEN secret needed.
 
 on:
   push:
-    tags:
-      - 'wpp-v*'
+    branches:
+      - publish
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -32,14 +32,17 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (publish branch)
         uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.14.0
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm (>= 11.5.1 required for trusted publishing)
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: npm ci || npm install
@@ -47,18 +50,12 @@ jobs:
       - name: Build (root package)
         run: npm run build
 
-      - name: Apply @wppconnect scope (runner only, not committed)
+      - name: Publish root package to npm (OIDC)
         run: |
-          VERSION="${GITHUB_REF_NAME#wpp-v}"
-          npm pkg set name='@wppconnect/zapo'
-          npm pkg set version="${VERSION}"
-          npm pkg set 'publishConfig.access'='public'
-          echo "Publishing @wppconnect/zapo@${VERSION} (root package only)"
-
-      - name: Publish root package to npm
-        run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-alpha"* || "${GITHUB_REF_NAME}" == *"-rc"* || "${GITHUB_REF_NAME}" == *"-beta"* ]]; then
-            npm publish --provenance --access public --tag next --workspaces=false
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION already published, skipping."
           else
-            npm publish --provenance --access public --workspaces=false
+            npm publish --workspaces=false
           fi

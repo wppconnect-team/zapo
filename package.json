@@ -1,5 +1,5 @@
 {
-    "name": "zapo-js",
+    "name": "@wppconnect/zapo",
     "version": "0.3.0",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
@@ -201,5 +201,12 @@
         "typescript": "^5.7.3",
         "typescript-eslint": "^8.56.1",
         "ws": "^8.18.3"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/wppconnect-team/zapo.git"
+    },
+    "publishConfig": {
+        "access": "public"
     }
 }
