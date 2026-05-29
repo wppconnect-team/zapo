@@ -69,8 +69,15 @@ const store = createStore({
     providers: {
         auth: 'sqlite',
         signal: 'sqlite',
+        preKey: 'sqlite',
+        session: 'sqlite',
+        identity: 'sqlite',
         senderKey: 'sqlite',
-        appState: 'sqlite'
+        appState: 'sqlite',
+        privacyToken: 'sqlite',
+        messages: 'sqlite', // 'none' to skip the message archive
+        threads: 'sqlite', // 'none' to skip
+        contacts: 'sqlite' // 'none' to skip
     }
 })
 
