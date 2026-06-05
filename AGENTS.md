@@ -899,7 +899,7 @@ This project follows [Semantic Versioning](https://semver.org/). From `1.0.0` th
 Changesets tracks the optional packages **only**, not the core. The root `package.json` (`zapo-js`) is the workspace anchor, so `@manypkg`/Changesets exclude it from the releasable set – `npx changeset add` does not even list it.
 
 - **Optional packages (`@zapo-js/*`)** – versioned with Changesets. Add a changeset in the PR that changes them: `npx changeset`, pick the packages and bump levels, write the summary. The file lands in `.changeset/`.
-- **Core (`zapo-js`)** – versioned by hand. Bump the root `version` directly with `npm version <patch|minor|major> --no-git-tag-version` (bumps the root only); Changesets never touches it.
+- **Core (`zapo-js`)** – versioned by hand. Bump the root `version` directly with `npm version <patch|minor|major> --no-git-tag-version` (bumps the root only); Changesets never touches it. Its root `CHANGELOG.md` is likewise hand-maintained (see the release process below); `changeset version` only writes the add-on `packages/<name>/CHANGELOG.md` files, never the core's.
 
 ### Release process (on `master`, before pushing the tag)
 
@@ -913,10 +913,11 @@ Changesets tracks the optional packages **only**, not the core. The root `packag
 2. Write a changeset for every add-on the AI flagged that does not have one yet (`npx changeset`), then confirm with `npm run changeset:status`.
 3. Apply the add-on bumps + changelogs: `npm run version:packages` (runs `changeset version`, consumes the `.changeset/*.md`).
 4. Bump the core by hand if it changed, at the level the AI proposed: `npm version <level> --no-git-tag-version`.
-5. Commit everything as one release commit: `chore: release vX.Y.Z`, where `X.Y.Z` is the core version.
-6. Tag with the core version and push it: `git tag vX.Y.Z && git push && git push origin vX.Y.Z`.
+5. Update the root `CHANGELOG.md` by hand from the core release-notes summary in step 1: add a `## X.Y.Z` section above the previous version, grouping the core feats under `### Minor Changes` and the fixes under `### Patch Changes` (the Changesets style the file already uses). Omit `ci`/`docs`/`chore`-only commits. The add-on `CHANGELOG.md` files are already written by `changeset version` in step 3 – only the core's is hand-edited.
+6. Commit everything as one release commit: `chore: release vX.Y.Z`, where `X.Y.Z` is the core version. One commit carries the core version bump, the `CHANGELOG.md` entry, and the add-on changeset bumps together.
+7. Tag with the core version and push it: `git tag vX.Y.Z && git push && git push origin vX.Y.Z`.
 
-Pushing the `v*` tag triggers `.github/workflows/release.yml`, which publishes via npm trusted publishing (OIDC, no `NPM_TOKEN`): the core through a guarded `npm publish` (skipped when its version is already on the registry) and the add-ons through `changeset publish` (only the `@zapo-js/*` whose version is not yet on npm). `.github/workflows/github-release.yml` creates the GitHub Release from the same tag.
+Pushing the `v*` tag triggers `.github/workflows/release.yml`, which publishes via npm trusted publishing (OIDC, no `NPM_TOKEN`): the core through a guarded `npm publish` (skipped when its version is already on the registry) and the add-ons through `changeset publish` (only the `@zapo-js/*` whose version is not yet on npm). `.github/workflows/github-release.yml` creates the GitHub Release from the same tag, with notes auto-generated from merged PRs (categories in `.github/release.yml`) – these are separate from, and not a replacement for, the hand-written root `CHANGELOG.md` from step 5.
 
 Every published package must be registered as a trusted publisher on npmjs.com (repo `vinikjkkj/zapo`, workflow `release.yml`) before its first CI publish. A brand new package name cannot be pre-configured – publish it once manually, then switch to trusted publishing.
 
