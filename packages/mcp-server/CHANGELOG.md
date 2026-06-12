@@ -1,5 +1,11 @@
 # @zapo-js/mcp-server
 
+## 1.0.2
+
+### Patch Changes
+
+- Auto-enable the mobile transport from persisted `deviceInfo`, so a mobile-registered MCP session reconnects in mobile mode without re-passing transport options.
+
 ## 1.0.1
 
 ### Patch Changes

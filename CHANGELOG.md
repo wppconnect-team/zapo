@@ -1,5 +1,20 @@
 # zapo-js
 
+## 1.1.2
+
+### Patch Changes
+
+- Skip placeholder-message resend on a mobile-primary session and fall back to plain retry receipts, since a primary phone has no peer device to ask for the original plaintext.
+- Apply local `pushName` changes immediately and route the app-state echo, so a self-initiated display-name update reflects locally without waiting for the server round-trip.
+- Derive mobile-primary mode from persisted `deviceInfo` so a registered mobile session reconnects fully in mobile mode (id formats, app-state primary gating, placeholder-resend withholding) without re-passing `{ mobileTransport }` on every construction.
+- Treat the mobile primary as authoritative for app-state and resolve sync conflicts in its favor, preventing a server snapshot from overwriting local primary state.
+- Carry the trusted-contact (privacy) token on retry resends so privacy-gated recipients accept the resend instead of nacking it with error 463.
+- Send raw 32-byte public keys (not version-prefixed) in the retry keys section, matching wa-web so the peer can rebuild the session from a retry receipt.
+- Defer decrypt-failure handling to a bounded queue and ack undecryptable stanzas, preventing inbound-pipeline stalls and stopping redelivery loops on the give-up path.
+- Skip undecodable previous Signal sessions during the decrypt fallback instead of aborting, so a corrupt prior session no longer blocks decryption with a still-valid one.
+- Resolve the self-author participant on recovered group events, fixing author attribution when a group message is recovered via placeholder resend.
+- Gate the noise IK resume on registered sessions so a freshly-paired/unregistered session does not attempt an invalid identity-key resume.
+
 ## 1.1.1
 
 ### Patch Changes
