@@ -13,11 +13,10 @@ from the **`publish`** branch via **OIDC trusted publishing** (no npm token).
 - `publish` is the only branch where `package.json` has the scoped `name` and
   the fork's `repository.url` (OIDC provenance requires the repo to match).
 
-## First publish (trusted publishing)
+## First publish (manual, then trusted publishing)
 
-Create the trusted publisher relationship once. This authorizes the GitHub
-Actions workflow to create and publish this package without a long-lived npm
-token:
+Create the package once with an interactive publish. This uses the npm account's
+2FA and does not require a long-lived CI token:
 
 ```bash
 git fetch origin
@@ -26,6 +25,14 @@ npm ci || npm install
 npm run build
 
 npm login                 # account with rights on the @wppconnect scope
+npm publish --workspaces=false --access public
+```
+
+After the package exists, create the trusted publisher relationship. This
+authorizes the GitHub Actions workflow to publish future versions without an npm
+token:
+
+```bash
 npm trust github @wppconnect/zapo \
   --repo wppconnect-team/zapo \
   --file publish-wppconnect.yml \
