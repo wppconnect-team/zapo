@@ -18,10 +18,10 @@ const RETRY_REASON_MATCHERS = [
     },
     { matches: ['invalid signature'], code: RETRY_REASON.SignalErrorInvalidSignature },
     {
-        matches: ['too many messages in future', 'future message'],
+        matches: ['too far in future', 'too many messages in future', 'future message'],
         code: RETRY_REASON.SignalErrorFutureMessage
     },
-    { matches: ['invalid mac'], code: RETRY_REASON.SignalErrorBadMac },
+    { matches: ['invalid message mac', 'invalid mac'], code: RETRY_REASON.SignalErrorBadMac },
     { matches: ['invalid session'], code: RETRY_REASON.SignalErrorInvalidSession },
     { matches: ['invalid message key'], code: RETRY_REASON.SignalErrorInvalidMsgKey },
     {

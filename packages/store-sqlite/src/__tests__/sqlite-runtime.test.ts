@@ -319,14 +319,10 @@ test('sqlite retry store tracks outbound state, inbound counters and expiration'
         const outbound: WaRetryOutboundMessageRecord = {
             messageId: 'm1',
             toJid: '5511@s.whatsapp.net',
-            participantJid: '5512@s.whatsapp.net',
-            recipientJid: '5513@s.whatsapp.net',
             eligibleRequesterDeviceJids: ['5511@s.whatsapp.net', '5511:1@s.whatsapp.net'],
-            messageType: 'text',
             replayMode: 'encrypted',
             replayPayload: makeBytes(12, 1),
             state: 'pending',
-            createdAtMs: 1000,
             updatedAtMs: 1000,
             expiresAtMs: 1500
         }
@@ -534,6 +530,21 @@ test('sqlite signal store covers prekeys, sessions, identities and state helpers
 
         await preKeyStore.setServerHasPreKeys(true)
         assert.equal(await preKeyStore.getServerHasPreKeys(), true)
+
+        // Regression: a generator returning an already-stored keyId must fail fast
+        // (insert is a no-op) instead of looping forever - the bootstrap hang.
+        const collidingPair = await X25519.generateKeyPair()
+        await preKeyStore.putPreKey({ keyId: 4242, keyPair: collidingPair, uploaded: false })
+        await preKeyStore.markKeyAsUploaded(4242)
+        await assert.rejects(
+            () =>
+                preKeyStore.getOrGenSinglePreKey(async () => ({
+                    keyId: 4242,
+                    keyPair: collidingPair,
+                    uploaded: false
+                })),
+            /made no progress/
+        )
 
         const sessionAddressA = makeAddress('5511', 0)
         const sessionAddressB = makeAddress('5522', 0)

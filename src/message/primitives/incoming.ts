@@ -1,7 +1,10 @@
 import type {
     WaIncomingMessageEvent,
+    WaIncomingMessageKey,
     WaIncomingNewsletterMessageUpdateEvent,
-    WaIncomingUnhandledStanzaEvent
+    WaIncomingUnavailableMessageEvent,
+    WaIncomingUnhandledStanzaEvent,
+    WaUnavailableMessageKind
 } from '@client/types'
 import type { Logger } from '@infra/log/types'
 import { pickIncomingExpirationSeconds } from '@message/context-info'
@@ -11,9 +14,11 @@ import { processIncomingNewsletterMessage } from '@message/kinds/newsletter'
 import { proto } from '@proto'
 import { WA_MESSAGE_TAGS, WA_MESSAGE_TYPES } from '@protocol/constants'
 import {
+    canonicalizeOwnAccountJid,
     isBroadcastJid,
     isGroupJid,
     isNewsletterJid,
+    isOwnAccountJid,
     parseJidFull,
     parseSignalAddressFromJid,
     toUserJid
@@ -31,6 +36,7 @@ interface WaIncomingMessageAckHandlerOptions {
     readonly logger: Logger
     readonly sendNode: (node: BinaryNode) => Promise<void>
     readonly getMeJid?: () => string | null | undefined
+    readonly getMeLid?: () => string | null | undefined
     readonly signalProtocol?: SignalProtocol
     readonly senderKeyManager?: SenderKeyManager
     readonly onDecryptFailure?: (
@@ -39,6 +45,7 @@ interface WaIncomingMessageAckHandlerOptions {
     ) => Promise<boolean>
     readonly emitIncomingMessage?: (event: WaIncomingMessageEvent) => void
     readonly emitNewsletterMessageUpdate?: (event: WaIncomingNewsletterMessageUpdateEvent) => void
+    readonly emitUnavailableMessage?: (event: WaIncomingUnavailableMessageEvent) => void
     readonly emitUnhandledStanza?: (event: WaIncomingUnhandledStanzaEvent) => void
 }
 
@@ -68,6 +75,62 @@ function extractMessageIdentityAttrs(attrs: BinaryNode['attrs']): MessageIdentit
         ...(rawRecipient ? { recipientJid: toUserJid(rawRecipient) } : {}),
         ...(rawRecipientAlt ? { recipientAlt: toUserJid(rawRecipientAlt) } : {}),
         pushName: attrs.notify
+    }
+}
+
+type MessageKeyIdentity = Omit<MessageIdentityAttrs, 'pushName'>
+
+/**
+ * Self-authored 1:1 chat is the recipient, so its alternate addressing is the
+ * `recipient*` attrs (the `sender*` attrs describe me). Promotes `recipientAlt`
+ * to `remoteJidAlt` and drops the stale sender/recipient fields.
+ */
+function promoteRecipientAddressing(identity: MessageKeyIdentity): MessageKeyIdentity {
+    return {
+        ...(identity.recipientAlt ? { remoteJidAlt: identity.recipientAlt } : {}),
+        ...(identity.senderUsername !== undefined
+            ? { senderUsername: identity.senderUsername }
+            : {})
+    }
+}
+
+/**
+ * Resolves the {@link WaIncomingMessageKey} for a decrypted stanza. `remoteJid`
+ * is the chat: the `from`, or the recipient (`recipient` attr, then the
+ * deviceSentMessage `destinationJid`) when the message is `fromMe`.
+ */
+function buildIncomingMessageKey(
+    node: BinaryNode,
+    sender: { readonly userJid: string; readonly device: number } | null,
+    options: WaIncomingMessageAckHandlerOptions,
+    destinationJid?: string
+): { readonly key: WaIncomingMessageKey; readonly pushName: string | undefined } {
+    const fromUserJid = node.attrs.from ? toUserJid(node.attrs.from) : node.attrs.from
+    const isGroup = fromUserJid ? isGroupJid(fromUserJid) : false
+    const isBroadcast = fromUserJid ? isBroadcastJid(fromUserJid) : false
+    const fromMe = sender
+        ? isOwnAccountJid(sender.userJid, options.getMeJid?.(), options.getMeLid?.())
+        : false
+    const selfSentChat =
+        fromMe && !isGroup && !isBroadcast
+            ? (node.attrs.recipient ?? destinationJid ?? undefined)
+            : undefined
+    const chatJid = selfSentChat ? toUserJid(selfSentChat) : fromUserJid
+    const { pushName, ...identity } = extractMessageIdentityAttrs(node.attrs)
+    const keyIdentity = selfSentChat ? promoteRecipientAddressing(identity) : identity
+    return {
+        pushName,
+        key: {
+            remoteJid: chatJid ?? '',
+            id: node.attrs.id ?? '',
+            fromMe,
+            isGroup,
+            isBroadcast,
+            isNewsletter: false,
+            ...keyIdentity,
+            senderDevice: sender?.device ?? 0,
+            ...((isGroup || isBroadcast) && sender ? { participant: sender.userJid } : {})
+        }
     }
 }
 
@@ -117,15 +180,26 @@ function buildIncomingEventRawNode(node: BinaryNode): BinaryNode {
     }
 }
 
+/**
+ * Rebuilds a `message` event from a recovered {@link proto.IWebMessageInfo}
+ * (placeholder resend). `meJid` is the current account user JID, used as the
+ * author fallback for self-sent group messages when the proto carries no
+ * participant and no `originalSelfAuthorUserJidString`.
+ */
 export function buildRecoveredIncomingEvent(
-    webMessageInfo: proto.IWebMessageInfo
+    webMessageInfo: proto.IWebMessageInfo,
+    meJid?: string | null
 ): WaIncomingMessageEvent {
     const key = webMessageInfo.key ?? {}
     const chatJid = key.remoteJid ?? undefined
     const fromMe = key.fromMe === true
-    const participant = key.participant ?? undefined
     const isGroup = chatJid ? isGroupJid(chatJid) : false
     const isBroadcast = chatJid ? isBroadcastJid(chatJid) : false
+    const rawSelfAuthor = webMessageInfo.originalSelfAuthorUserJidString ?? meJid ?? undefined
+    const selfAuthor =
+        fromMe && (isGroup || isBroadcast) && rawSelfAuthor ? toUserJid(rawSelfAuthor) : undefined
+    const participant = webMessageInfo.participant ?? key.participant ?? selfAuthor
+    const pushName = webMessageInfo.pushName ?? undefined
     const rawSender = fromMe ? undefined : isGroup || isBroadcast ? participant : chatJid
     const sender = rawSender ? parseJidFull(rawSender) : null
     const senderDevice = sender?.address.device
@@ -141,7 +215,8 @@ export function buildRecoveredIncomingEvent(
         attrs: {
             ...(stanzaId !== undefined ? { id: stanzaId } : {}),
             ...(chatJid !== undefined ? { from: chatJid } : {}),
-            ...(participant !== undefined ? { participant } : {})
+            ...(participant !== undefined ? { participant } : {}),
+            ...(pushName !== undefined ? { notify: pushName } : {})
         }
     }
     return {
@@ -157,8 +232,8 @@ export function buildRecoveredIncomingEvent(
             senderDevice: senderDevice ?? 0
         },
         timestampSeconds,
-        encryptionType: 'placeholder_recovery',
         ...(expirationSeconds !== undefined ? { expirationSeconds } : {}),
+        ...(pushName !== undefined ? { pushName } : {}),
         message
     }
 }
@@ -263,7 +338,7 @@ async function sendRetryReceiptForDecryptFailure(
     })
     try {
         await options.sendNode(retryReceiptNode)
-        options.logger.debug('sent retry receipt for undecryptable incoming message', {
+        options.logger.trace('sent retry receipt for undecryptable incoming message', {
             id: stanzaId,
             to: from,
             participant: retryReceiptNode.attrs.participant,
@@ -318,32 +393,19 @@ function processMsmsgEncNode(
                 encPayload: decoded.encPayload
             }
         }
-        const chatJid = node.attrs.from
         const sender = senderJid ? parseJidFull(senderJid) : null
-        const isGroup = chatJid ? isGroupJid(chatJid) : false
-        const isBroadcast = chatJid ? isBroadcastJid(chatJid) : false
-        const { pushName, ...keyIdentity } = extractMessageIdentityAttrs(node.attrs)
+        const { key, pushName } = buildIncomingMessageKey(
+            node,
+            sender ? { userJid: sender.userJid, device: sender.address.device } : null,
+            options
+        )
         options.emitIncomingMessage?.({
             rawNode: buildIncomingEventRawNode(node),
-            key: {
-                remoteJid: chatJid ?? '',
-                id: node.attrs.id ?? '',
-                fromMe: false,
-                isGroup,
-                isBroadcast,
-                isNewsletter: false,
-                ...keyIdentity,
-                ...((isGroup || isBroadcast) && sender?.userJid
-                    ? { participant: sender.userJid }
-                    : {}),
-                senderDevice: sender?.address.device ?? 0
-            },
+            key,
             stanzaType: node.attrs.type,
             offline: node.attrs.offline !== undefined,
             timestampSeconds: parseOptionalInt(node.attrs.t),
             pushName,
-            encryptionType: 'msmsg',
-            plaintext: payload,
             message
         })
         return { success: true, encType: 'msmsg' }
@@ -373,6 +435,11 @@ async function decryptAndProcessEncNode(
     options: WaIncomingMessageAckHandlerOptions,
     decrypt: (ciphertext: Uint8Array, senderAddress: SignalAddress) => Promise<Uint8Array>
 ): Promise<DecryptEncNodeResult> {
+    const log = options.logger.child({
+        id: node.attrs.id,
+        from: node.attrs.from,
+        participant: node.attrs.participant
+    })
     try {
         const senderAddress = parseSignalAddressFromJid(senderJid)
         const decryptedPayload = await decrypt(
@@ -390,58 +457,41 @@ async function decryptAndProcessEncNode(
                     senderAddress,
                     senderKeyDistribution.payload
                 )
-                options.logger.debug('processed incoming sender key distribution', {
-                    id: node.attrs.id,
-                    from: node.attrs.from,
-                    participant: node.attrs.participant,
+                log.trace('processed incoming sender key distribution', {
                     groupId: senderKeyDistribution.groupId
                 })
             } catch (error) {
-                options.logger.warn('failed to process incoming sender key distribution', {
-                    id: node.attrs.id,
-                    from: node.attrs.from,
-                    participant: node.attrs.participant,
+                log.warn('failed to process incoming sender key distribution', {
                     groupId: senderKeyDistribution.groupId,
                     message: toError(error).message
                 })
             }
         }
         if (shouldEmitIncomingMessage(message)) {
-            const chatJid = node.attrs.from
-            const isGroup = chatJid ? isGroupJid(chatJid) : false
-            const isBroadcast = chatJid ? isBroadcastJid(chatJid) : false
-            const senderUserJid = `${senderAddress.user}@${senderAddress.server}`
-            const { pushName, ...keyIdentity } = extractMessageIdentityAttrs(node.attrs)
+            const { key, pushName } = buildIncomingMessageKey(
+                node,
+                {
+                    userJid: `${senderAddress.user}@${senderAddress.server}`,
+                    device: senderAddress.device
+                },
+                options,
+                decodedMessage.deviceSentMessage?.destinationJid ?? undefined
+            )
             const expirationSeconds = pickIncomingExpirationSeconds(message)
             options.emitIncomingMessage?.({
                 rawNode: buildIncomingEventRawNode(node),
-                key: {
-                    remoteJid: chatJid ?? '',
-                    id: node.attrs.id ?? '',
-                    fromMe: false,
-                    isGroup,
-                    isBroadcast,
-                    isNewsletter: false,
-                    ...keyIdentity,
-                    senderDevice: senderAddress.device,
-                    ...(isGroup || isBroadcast ? { participant: senderUserJid } : {})
-                },
+                key,
                 stanzaType: node.attrs.type,
                 offline: node.attrs.offline !== undefined,
                 timestampSeconds: parseOptionalInt(node.attrs.t),
                 ...(expirationSeconds !== undefined ? { expirationSeconds } : {}),
                 pushName,
-                encryptionType: encType,
-                plaintext: unpaddedPlaintext,
                 message
             })
         }
         return { success: true, encType }
     } catch (error) {
-        options.logger.warn('failed to decrypt incoming message', {
-            id: node.attrs.id,
-            from: node.attrs.from,
-            participant: node.attrs.participant,
+        log.warn('failed to decrypt incoming message', {
             encType,
             message: toError(error).message
         })
@@ -529,11 +579,22 @@ export async function handleIncomingMessageAck(
                         encType,
                         senderJid,
                         options,
-                        (ciphertext, senderAddress) =>
-                            options.signalProtocol!.decryptMessage(senderAddress, {
-                                type: encType,
-                                ciphertext
-                            })
+                        (ciphertext, senderAddress) => {
+                            const sessionJid = canonicalizeOwnAccountJid(
+                                senderJid,
+                                options.getMeJid?.(),
+                                options.getMeLid?.()
+                            )
+                            return options.signalProtocol!.decryptMessage(
+                                sessionJid === senderJid
+                                    ? senderAddress
+                                    : parseSignalAddressFromJid(sessionJid),
+                                {
+                                    type: encType,
+                                    ciphertext
+                                }
+                            )
+                        }
                     )
                     break
                 }
@@ -589,11 +650,53 @@ export async function handleIncomingMessageAck(
             to: from,
             from: options.getMeJid?.()
         })
-        options.logger.debug('sending inbound message ack', {
+        options.logger.trace('sending inbound message ack', {
             id,
             to: from,
             type: ackNode.attrs.type,
             participant: ackNode.attrs.participant
+        })
+        await options.sendNode(ackNode)
+        return true
+    }
+
+    const unavailableNode = findNodeChild(node, 'unavailable')
+    if (unavailableNode) {
+        const kind: WaUnavailableMessageKind =
+            unavailableNode.attrs.hosted === 'true'
+                ? 'hosted'
+                : unavailableNode.attrs.type === 'view_once'
+                  ? 'view_once'
+                  : 'other'
+        const senderJid = node.attrs.participant ?? node.attrs.from
+        const sender = senderJid ? parseJidFull(senderJid) : null
+        const { key, pushName } = buildIncomingMessageKey(
+            node,
+            sender ? { userJid: sender.userJid, device: sender.address.device } : null,
+            options
+        )
+        options.emitUnavailableMessage?.({
+            rawNode: buildIncomingEventRawNode(node),
+            key,
+            kind,
+            stanzaType: node.attrs.type,
+            offline: node.attrs.offline !== undefined,
+            timestampSeconds: parseOptionalInt(node.attrs.t),
+            pushName
+        })
+        const ackNode = buildAckNode({
+            kind: 'message',
+            node,
+            id,
+            to: from,
+            from: options.getMeJid?.()
+        })
+        options.logger.trace('acking unavailable incoming message', {
+            id,
+            to: from,
+            type: ackNode.attrs.type,
+            participant: ackNode.attrs.participant,
+            unavailableKind: kind
         })
         await options.sendNode(ackNode)
         return true
@@ -609,7 +712,7 @@ export async function handleIncomingMessageAck(
         id,
         to: from
     })
-    options.logger.debug('sending inbound message receipt', {
+    options.logger.trace('sending inbound message receipt', {
         id,
         to: from,
         type: receiptNode.attrs.type,
@@ -647,7 +750,7 @@ async function handleIncomingNewsletterMessage(
         id,
         to: from
     })
-    options.logger.debug('sending inbound newsletter message ack', {
+    options.logger.trace('sending inbound newsletter message ack', {
         id,
         to: from,
         type: ackNode.attrs.type

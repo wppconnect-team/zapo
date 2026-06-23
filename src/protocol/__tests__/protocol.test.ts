@@ -19,6 +19,7 @@ import {
 import {
     applyDeviceToJid,
     buildDeviceJid,
+    canonicalizeOwnAccountJid,
     canonicalizeSignalJid,
     canonicalizeSignalServer,
     getLoginIdentity,
@@ -30,6 +31,7 @@ import {
     isHostedDeviceJid,
     isHostedServer,
     isNewsletterJid,
+    isOwnAccountJid,
     isStatusBroadcastJid,
     normalizeDeviceJid,
     normalizeRecipientJid,
@@ -42,6 +44,35 @@ import type {
     WaPrivacyDisallowedListSettingName,
     WaPrivacySettingValueMap
 } from '@protocol/privacy'
+
+test('canonicalizeOwnAccountJid maps own PN device JIDs to LID', () => {
+    const meJid = '5512988950329:15@s.whatsapp.net'
+    const meLid = '91379841634519:15@lid'
+    assert.equal(
+        canonicalizeOwnAccountJid('5512988950329@s.whatsapp.net', meJid, meLid),
+        '91379841634519@lid'
+    )
+    assert.equal(
+        canonicalizeOwnAccountJid('5512988950329:0@s.whatsapp.net', meJid, meLid),
+        '91379841634519@lid'
+    )
+    assert.equal(
+        canonicalizeOwnAccountJid('5512988950329:12@s.whatsapp.net', meJid, meLid),
+        '91379841634519:12@lid'
+    )
+    assert.equal(
+        canonicalizeOwnAccountJid('91379841634519@lid', meJid, meLid),
+        '91379841634519@lid'
+    )
+    assert.equal(
+        canonicalizeOwnAccountJid('5511999999999@s.whatsapp.net', meJid, meLid),
+        '5511999999999@s.whatsapp.net'
+    )
+    assert.equal(
+        canonicalizeOwnAccountJid('5512988950329@s.whatsapp.net', meJid, null),
+        '5512988950329@s.whatsapp.net'
+    )
+})
 
 test('jid split and normalization helpers', () => {
     assert.deepEqual(splitJid('123@s.whatsapp.net'), {
@@ -83,6 +114,12 @@ test('jid type detection and device handling', () => {
     assert.throws(() => parseSignalAddressFromJid('5511:x@s.whatsapp.net'), /invalid jid device/)
 
     assert.equal(toUserJid('5511:3@s.whatsapp.net'), '5511@s.whatsapp.net')
+
+    assert.equal(isOwnAccountJid('5511:7@s.whatsapp.net', '5511@s.whatsapp.net', null), true)
+    assert.equal(isOwnAccountJid('1330@lid', '5511@s.whatsapp.net', '1330@lid'), true)
+    assert.equal(isOwnAccountJid('5599@s.whatsapp.net', '5511@s.whatsapp.net', '1330@lid'), false)
+    assert.equal(isOwnAccountJid('5511@s.whatsapp.net', null, null), false)
+
     assert.equal(normalizeDeviceJid('5511:0@s.whatsapp.net'), '5511@s.whatsapp.net')
     assert.equal(normalizeDeviceJid('5511:5@s.whatsapp.net'), '5511:5@s.whatsapp.net')
 

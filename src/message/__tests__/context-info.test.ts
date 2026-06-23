@@ -114,6 +114,103 @@ test('resolveSendContextInfo resolves quote from WaQuoteRef shape', () => {
     assert.deepEqual(result?.quotedMessage, { conversation: 'orig' })
 })
 
+test('resolveSendContextInfo derives DM quote participant from remoteJid when peer-authored', () => {
+    const result = resolveSendContextInfo({
+        quote: { key: { id: 'm-3', remoteJid: 'peer@lid', fromMe: false } }
+    })
+    assert.equal(result?.quotedParticipant, 'peer@lid')
+    assert.equal(result?.quotedRemoteJid, 'peer@lid')
+})
+
+test('resolveSendContextInfo derives DM quote participant from meLid when fromMe', () => {
+    const result = resolveSendContextInfo({
+        quote: { key: { id: 'm-4', remoteJid: 'peer@lid', fromMe: true } },
+        meLid: 'me@lid'
+    })
+    assert.equal(result?.quotedParticipant, 'me@lid')
+    assert.equal(result?.quotedRemoteJid, 'peer@lid')
+})
+
+test('resolveSendContextInfo does not derive DM fallback for group quote remoteJid', () => {
+    const result = resolveSendContextInfo({
+        quote: { key: { id: 'm-5', remoteJid: 'g@g.us', fromMe: false } }
+    })
+    assert.equal(result?.quotedParticipant, undefined)
+})
+
+test('resolveSendContextInfo prefers explicit quote participant over DM fallback', () => {
+    const result = resolveSendContextInfo({
+        quote: {
+            key: {
+                id: 'm-6',
+                remoteJid: 'peer@lid',
+                participant: 'explicit@lid',
+                fromMe: false
+            }
+        }
+    })
+    assert.equal(result?.quotedParticipant, 'explicit@lid')
+})
+
+test('resolveSendContextInfo reads top-level fromMe from a flat WaMessageKey quote', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-7', remoteJid: 'peer@lid', fromMe: true },
+        meLid: 'me@lid'
+    })
+    assert.equal(result?.quotedParticipant, 'me@lid')
+    assert.equal(result?.quotedRemoteJid, 'peer@lid')
+})
+
+test('resolveSendContextInfo uses peer for a flat WaMessageKey quote not fromMe', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-8', remoteJid: 'peer@lid', fromMe: false },
+        meLid: 'me@lid'
+    })
+    assert.equal(result?.quotedParticipant, 'peer@lid')
+})
+
+test('resolveSendContextInfo omits quotedRemoteJid for a same-chat quote', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-9', remoteJid: 'peer@lid', fromMe: false },
+        targetJid: 'peer@lid'
+    })
+    assert.equal(result?.quotedRemoteJid, undefined)
+    assert.equal(result?.quotedParticipant, 'peer@lid')
+    assert.equal(result?.quotedMessageId, 'm-9')
+})
+
+test('resolveSendContextInfo emits quotedRemoteJid for a cross-chat quote', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-10', remoteJid: 'other@lid', fromMe: false },
+        targetJid: 'peer@lid'
+    })
+    assert.equal(result?.quotedRemoteJid, 'other@lid')
+})
+
+test('resolveSendContextInfo treats a device-suffixed target as the same chat', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-11', remoteJid: 'peer@lid', fromMe: false },
+        targetJid: 'peer:3@lid'
+    })
+    assert.equal(result?.quotedRemoteJid, undefined)
+})
+
+test('resolveSendContextInfo emits quotedRemoteJid when no target is provided', () => {
+    const result = resolveSendContextInfo({
+        quote: { id: 'm-12', remoteJid: 'peer@lid', fromMe: false }
+    })
+    assert.equal(result?.quotedRemoteJid, 'peer@lid')
+})
+
+test('resolveSendContextInfo clears an inherited quotedRemoteJid for a same-chat quote', () => {
+    const result = resolveSendContextInfo({
+        optionsLevel: { quotedRemoteJid: 'stale@lid' },
+        quote: { id: 'm-13', remoteJid: 'peer@lid', fromMe: false },
+        targetJid: 'peer@lid'
+    })
+    assert.equal(result?.quotedRemoteJid, undefined)
+})
+
 test('resolveSendContextInfo applies forward with default score', () => {
     const result = resolveSendContextInfo({ forward: true })
     assert.equal(result?.isForwarded, true)

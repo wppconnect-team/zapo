@@ -121,12 +121,11 @@ export interface WaProfileCoordinator {
     readonly setStatus: (text: string) => Promise<void>
     /**
      * Sets the account's pushName - the display name broadcast to other
-     * users in chats and group participant lists. WhatsApp Web applies the
-     * change via a `SettingPushName` app-state mutation (collection
-     * `critical_block`); the new value reaches peers as their next
-     * incoming-message envelope from this account carries the updated
-     * `notify` attr. Empty strings are accepted but reset the display name
-     * to the device fingerprint default.
+     * users in chats and group participant lists. Writes a `SettingPushName`
+     * app-state mutation to sync the account's other devices, persists the
+     * name locally, and re-broadcasts an available presence carrying it (the
+     * step that propagates the name on primary connections, where no phone
+     * re-broadcasts on this device's behalf). Empty strings clear the name.
      */
     readonly setPushName: (name: string) => Promise<void>
     /** Batched usync fetch of picture id + status for many JIDs. */
@@ -197,6 +196,19 @@ interface WaProfileCoordinatorOptions {
      * mutations.
      */
     readonly mutations: WaAppStateMutationCoordinator
+    /**
+     * Applies a pushName change locally: persists the display name and
+     * re-broadcasts an available presence carrying it. Expected to be
+     * idempotent (a no-op when the name already matches).
+     */
+    readonly applyOwnPushName: (name: string) => Promise<void>
+    /**
+     * Resolves the receiver-mode `<tctoken>` node for a contact, echoed back on
+     * privacy-gated profile queries (picture get, about/status usync) to prove
+     * this account is a trusted contact. Returns `null` when no valid token is
+     * held for the JID.
+     */
+    readonly resolvePrivacyTokenNode: (jid: string) => Promise<BinaryNode | null>
     readonly logger: Logger
 }
 
@@ -206,10 +218,10 @@ function parseProfilePicture(result: BinaryNode): WaProfilePictureResult {
         return {}
     }
     return {
-        url: pictureNode.attrs.url as string | undefined,
-        directPath: pictureNode.attrs.direct_path as string | undefined,
-        id: pictureNode.attrs.id as string | undefined,
-        type: pictureNode.attrs.type as string | undefined
+        url: pictureNode.attrs.url,
+        directPath: pictureNode.attrs.direct_path,
+        id: pictureNode.attrs.id,
+        type: pictureNode.attrs.type
     }
 }
 
@@ -322,15 +334,11 @@ function parseUsyncTextStatuses(result: BinaryNode): readonly WaTextStatusResult
             const emojiNode = findNodeChild(textStatusNode, 'emoji')
             entry = {
                 jid,
-                text: (textStatusNode.attrs.text as string | undefined) ?? null,
+                text: textStatusNode.attrs.text ?? null,
                 emoji: emojiNode?.attrs.content ?? null,
                 ephemeralDurationSec:
-                    parseOptionalSignedInt(
-                        textStatusNode.attrs.ephemeral_duration_sec as string | undefined
-                    ) ?? null,
-                lastUpdateTime:
-                    parseOptionalInt(textStatusNode.attrs.last_update_time as string | undefined) ??
-                    null
+                    parseOptionalSignedInt(textStatusNode.attrs.ephemeral_duration_sec) ?? null,
+                lastUpdateTime: parseOptionalInt(textStatusNode.attrs.last_update_time) ?? null
             }
         }
 
@@ -435,12 +443,21 @@ function buildTextStatusMutationInput(input: WaSetTextStatusInput): {
 export function createProfileCoordinator(
     options: WaProfileCoordinatorOptions
 ): WaProfileCoordinator {
-    const { queryWithContext, generateSid, mexSocket, queryLidsByPhoneJids, mutations, logger } =
-        options
+    const {
+        queryWithContext,
+        generateSid,
+        mexSocket,
+        queryLidsByPhoneJids,
+        mutations,
+        applyOwnPushName,
+        resolvePrivacyTokenNode,
+        logger
+    } = options
 
     return {
         getProfilePicture: async (jid, type, existingId) => {
-            const node = buildGetProfilePictureIq(jid, type, existingId)
+            const privacyTokenNode = (await resolvePrivacyTokenNode(jid)) ?? undefined
+            const node = buildGetProfilePictureIq(jid, type, existingId, privacyTokenNode)
             const result = await queryWithContext('profile.getPicture', node, undefined, {
                 jid,
                 type: type ?? 'preview'
@@ -470,10 +487,11 @@ export function createProfileCoordinator(
         getStatus: async (jid) => {
             const sid = await generateSid()
             const queryNodes = buildGetStatusUsyncQueryNodes()
+            const privacyTokenNode = await resolvePrivacyTokenNode(jid)
             const usyncNode = buildUsyncIq({
                 sid,
                 queryProtocolNodes: [queryNodes[1]],
-                users: [{ jid }]
+                users: [{ jid, ...(privacyTokenNode ? { content: [privacyTokenNode] } : {}) }]
             })
             const result = await queryWithContext('profile.getStatus', usyncNode, undefined, {
                 jid
@@ -492,6 +510,9 @@ export function createProfileCoordinator(
         },
 
         setPushName: async (name) => {
+            // Local apply first: the app-state echo of this same write then
+            // collapses into a no-op via applyOwnPushName's idempotency guard.
+            await applyOwnPushName(name)
             await mutations.set({ schema: 'SettingPushName', name })
         },
 
@@ -501,10 +522,16 @@ export function createProfileCoordinator(
             }
             const sid = await generateSid()
             const queryProtocolNodes = buildGetStatusUsyncQueryNodes()
+            const users = await Promise.all(
+                jids.map(async (jid) => {
+                    const privacyTokenNode = await resolvePrivacyTokenNode(jid)
+                    return { jid, ...(privacyTokenNode ? { content: [privacyTokenNode] } : {}) }
+                })
+            )
             const usyncNode = buildUsyncIq({
                 sid,
                 queryProtocolNodes,
-                users: jids.map((jid) => ({ jid }))
+                users
             })
             const result = await queryWithContext('profile.getProfiles', usyncNode, undefined, {
                 count: jids.length

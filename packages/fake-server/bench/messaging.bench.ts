@@ -98,7 +98,7 @@ function forceGcIfAvailable(): void {
     if (gc) gc()
 }
 
-const NOOP_LOGGER: Logger = {
+const benchLogger: Logger = {
     level: 'error',
     trace: () => {},
     debug: () => {},
@@ -108,8 +108,10 @@ const NOOP_LOGGER: Logger = {
     },
     error: (...args: unknown[]) => {
         if (process.env.ZAPO_BENCH_VERBOSE) console.error('[lib error]', ...args)
-    }
+    },
+    child: () => benchLogger
 }
+const NOOP_LOGGER: Logger = benchLogger
 
 // ─── Profiler ─────────────────────────────────────────────────────────
 
@@ -265,10 +267,7 @@ class BenchProfiler {
         try {
             await this.session.post('HeapProfiler.takeHeapSnapshot', { reportProgress: false })
         } finally {
-            this.session.removeListener(
-                'HeapProfiler.addHeapSnapshotChunk',
-                onChunk as unknown as (m: object) => void
-            )
+            this.session.removeListener('HeapProfiler.addHeapSnapshotChunk', onChunk)
         }
         const out = this.fileName(`snapshot-${label}`, 'heapsnapshot')
         const content = chunks.join('')
@@ -296,10 +295,7 @@ class BenchProfiler {
             })
             await this.session.post('HeapProfiler.stopTrackingHeapObjects')
         } finally {
-            this.session.removeListener(
-                'HeapProfiler.addHeapSnapshotChunk',
-                onChunk as unknown as (m: object) => void
-            )
+            this.session.removeListener('HeapProfiler.addHeapSnapshotChunk', onChunk)
         }
         const out = this.fileName('heap', 'heaptimeline')
         const content = chunks.join('')
@@ -850,7 +846,7 @@ async function mainSeparateProcess(
     results: ScenarioResult[]
     cleanup: () => Promise<void>
 }> {
-    const { ServerRpc } = await import('./server-rpc')
+    const { ServerRpc } = await import('./server-rpc.js')
     const rpc = new ServerRpc()
     await rpc.spawn()
     await rpc.start()

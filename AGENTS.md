@@ -94,6 +94,7 @@ Other important directories:
 - `examples/` runnable example scripts (can import `zapo-js` and `@zapo-js/*` by name)
 - `.github/workflows/ci.yml` lint + format + typecheck + build-core + typecheck-packages + per-provider tests (core, fake-server, media-utils, sqlite, mcp-server, mysql, postgres, redis, mongo) gated by an `all-checks` job
 - `.github/workflows/github-release.yml` auto-generates release notes when a `v*` tag is pushed (categories in `.github/release.yml`)
+- `.github/workflows/release.yml` publishes to npm on a `v*` tag via trusted publishing (OIDC, no `NPM_TOKEN`): core (`zapo-js`) through a guarded `npm publish`, add-ons (`@zapo-js/*`) through `changeset publish`
 - `.github/workflows/pr-auto-label.yml` labels PRs from conventional-commit prefixes in the title
 - `.github/workflows/pr-validate-title.yml` enforces a conventional-commit PR title (`amannn/action-semantic-pull-request`)
 - `.changeset/` release management config (Changesets)
@@ -261,11 +262,101 @@ try {
 
 ### 5.7 Logging
 
-- Use structured logs: message + context object.
-- Keep log messages lowercase and descriptive.
+The `Logger` interface lives in `@infra/log/types` with 5 levels (trace,
+debug, info, warn, error), a `(message, context?)` signature, and a
+`child(bindings)` method that returns a derived logger with pre-bound
+fields. Adapters: `ConsoleLogger` (zero-dep default) and `PinoLogger`
+(optional pino-backed).
+
+#### General rules
+
+- Use structured logs: lowercase static message + context object. Never
+  interpolate variables into the message string (`'failed to send'` +
+  `{ kind }`, **not** `` `failed to send ${kind}` ``). String interpolation
+  in the message breaks log-aggregator deduplication.
+- Use `toError(e).message` in catches; never log the raw error or stack.
 - Log IDs/tags/sizes/durations when relevant.
 - Never log key material, secret values, or raw sensitive payload bytes.
-- Avoid `console.log` in runtime source (`src/`), except explicit example/test contexts.
+  `keyId` rendered as hex (`bytesToHex(...)`) is public and safe.
+- Avoid `console.log` in runtime source (`src/`), except explicit example
+  or test contexts.
+
+#### Level rubric
+
+Apply these semantics consistently; mis-leveling makes `level: debug`
+unusable in staging because hot paths drown the operator.
+
+| Level | Meaning                                                         | Examples                                                                                              |
+| ----- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| error | invariant violation / non-recoverable failure (rare)            | noise handshake failed, MAC validation failed, pending-frame buffer overflow, primary recipient drop  |
+| warn  | abnormal but auto-handled (fallback / retry / degraded path)    | socket open failed (will retry), ack mismatch triggering refetch, fanout dropping secondary devices   |
+| info  | lifecycle boundary, once per long-lived event                   | `wa client connected`, `pair-success credentials updated`, `noise session established`, prekey upload |
+| debug | per-operation internals for active troubleshooting              | per-send envelope build, per-retry-request rejection, sync key request response                       |
+| trace | per-frame / per-iteration / hot path; only with explicit filter | per-incoming-stanza ack/receipt, per-frame noise codec calls, filter-dropped stanzas                  |
+
+Concrete rules that fall out of this:
+
+- **Per-message / per-frame / per-send logs must never exceed `trace`.**
+  In a high-volume account, anything at `debug` here will drown the log.
+- **Auto-recovered fallback paths are `debug`, not `warn`.** Warn is for
+  things the operator should actually see at default level.
+- **`info` is for operator-visible lifecycle events**, not for narration of
+  what a method is doing. `'X started'` / `'X finished'` pairs around
+  routine syncs belong at `debug`.
+- **Aggregate per-target failures in batch operations.** A per-device
+  warn in fanout fires N times per group send. Collect into a single warn
+  with `{ droppedCount, totalExpected, sample: jids.slice(0, 3) }` after
+  the loop.
+
+#### Use `child(bindings)` for repeated context
+
+When a function emits 3+ logs that all carry the same field (`jid`, `id`,
+`from`, `requester`, etc.), bind it once with `logger.child({ ... })` and
+drop the field from every per-call context object. Bindings stack;
+per-call context wins on key conflicts.
+
+```ts
+const requesterLogger = this.deps.logger.child({
+    id: request.stanzaId,
+    originalMsgId: request.originalMsgId,
+    requester: requesterJid
+})
+requesterLogger.debug('retry request rejected: retry count exceeded', {
+    remoteRetryCount: request.retryCount
+})
+```
+
+Current adopters worth modeling after:
+`signal/session/resolver.ts` (`{ jid }`),
+`client/coordinators/WaRetryCoordinator.ts` (`{ id, originalMsgId, requester }`),
+`appstate/sync/WaAppStateSyncClient.ts` (`{ id, from }`).
+
+#### Optional packages: receive the logger via per-call `ctx`, never a callback or a mutable slot
+
+Optional packages (`@zapo-js/media-utils`, future store/transport addons)
+that need to emit warnings must NOT accept a logging callback in their
+options, and must NOT keep a mutable logger slot the caller has to wire
+up. Instead, accept the logger via a per-call context arg on each method
+of the contract:
+
+```ts
+export interface WaSomeProcessorCallContext {
+    readonly logger?: Logger
+}
+
+export interface WaSomeProcessor {
+    readonly doSomething?: (input: Input, ctx?: WaSomeProcessorCallContext) => Promise<Result>
+    // ...rest of the contract
+}
+```
+
+The runtime fills `ctx.logger` with the relevant child logger (typically
+`callerLogger.child({ scope: '@zapo-js/<name>' })`) on every call. This
+keeps the package implementation **stateless**, so a single instance is
+safe to share across multiple `WaClient` sessions - each invocation
+lands its warnings in the right session log without any per-session
+plumbing. Canonical example: `WaMediaProcessor` in
+`src/media/processor.ts` + `packages/media-utils/src/index.ts`.
 
 ### 5.8 Sensitive types
 
@@ -534,7 +625,7 @@ Use flow tests for auth/transport/signal/retry changes that need real protocol v
 
 Do not redefine common fixtures inline. Shared helpers live in `@infra/log/types`:
 
-- `createNoopLogger(level?)` – silent `Logger` for tests. Use instead of redefining a local `function createLogger(): Logger { return { level: 'trace', trace: () => undefined, ... } }`.
+- `createNoopLogger(level?)` – silent `Logger` for tests. Use instead of redefining a local `function createLogger(): Logger { return { level: 'trace', trace: () => undefined, child: () => ... } }`. Also re-exported from the public root (`'zapo-js'`) so optional packages can import it the same way.
 
 Add new shared test-only helpers to a sibling `__tests__/_helpers.ts` only when reused across 3+ files.
 
@@ -570,10 +661,12 @@ PR comment script (`scripts/build-bench-comment.cjs`) consumes:
 - `Buffer` usage in runtime modules
 - silent catches without logs/context
 - secret leakage in logs
+- per-message / per-frame / per-send logs above `trace` level (§5.7). In high-volume accounts, a per-send `debug` drowns the log and makes `level: debug` unusable in staging.
 - duplicate protocol parsing/building across modules when a shared helper is appropriate
 - monolithic coordinators doing build + parse + orchestration inline without separation
 - `uint8Equal()` / `===` for MAC/signature comparison instead of `uint8TimingSafeEqual()` (§7.5)
 - allocating a fixed-size buffer (e.g. AES nonce) per call in a hot path instead of using a per-instance scratch (§7.6)
+- accepting a logging callback (`onWarning`, `onLog`, ...) or a mutable `bindLogger(logger)` slot in an optional package's options instead of the per-call `ctx.logger` contract (§5.7). Callbacks lose level/structure; a mutable slot breaks when one processor is shared across multiple `WaClient` sessions (last-write-wins on the slot).
 
 ### Frequent review nits
 
@@ -585,6 +678,11 @@ PR comment script (`scripts/build-bench-comment.cjs`) consumes:
 - applying perf "optimizations" (`.slice()` → loop, `+=` → array+join, batched lookup over linear scan) without a benchmark proving the gain – V8 often beats the rewrite (§7.7)
 - deleting an export flagged by `knip`/`ts-prune` without verifying internal usage (default parameter values, same-file consumers, dynamic-import-only consumers, type-only imports)
 - redefining `function createLogger(): Logger { return { level: 'trace', ... } }` in test files instead of importing `createNoopLogger` from `@infra/log/types` (§9.2.1)
+- using `warn` for an auto-recovered fallback / retry path (§5.7). Warn is for things the operator should see at default level; auto-recovered paths are `debug`.
+- using `info` to narrate routine method internals (`'X start'` / `'X finished'` pairs around a sync). Info is reserved for once-per-lifecycle events.
+- string interpolation in the log message itself (`` `failed to send ${kind}` ``) instead of the context object (`'failed to send'` + `{ kind }`) (§5.7). Breaks log aggregator dedup.
+- emitting per-target `warn` in a loop over devices/jids in batch operations instead of aggregating after the loop with `{ droppedCount, totalExpected, sample: jids.slice(0, 3) }` (§5.7).
+- repeating the same field (`jid`, `id`, `requester`) in every log call inside a function with 3+ logs instead of binding it once via `logger.child({ ... })` (§5.7).
 - citing this guide (`AGENTS.md §N`, `see AGENTS`) in source comments, JSDoc, or commit messages. This guide is the contract for contributors, not runtime documentation. Section numbers and headings rot when the guide is reorganized, leaving stale pointers in source. Comments must stand on their own – explain _why_ the code is the way it is in plain language; if a rule needs the guide to be understood, restate the rule briefly in the comment.
 
 ---
@@ -790,11 +888,42 @@ After editing source: rebuild → call `restart` with `mode: "process_exit"` →
 
 ## 14. Versioning
 
-This project follows [Semantic Versioning](https://semver.org/). While on `0.x`, the API is not yet stable and breaking changes may occur in minor bumps. Use changesets (`npx changeset`) to track version bumps across all packages.
+This project follows [Semantic Versioning](https://semver.org/). From `1.0.0` the public API is stable: breaking changes ship only in a major bump.
 
 - `patch` – bug fixes, internal refactors with no API change
-- `minor` – new features, non-breaking additions (or breaking changes while `0.x`)
-- `major` – breaking API changes (after `1.0.0`)
+- `minor` – new features, non-breaking additions
+- `major` – breaking API changes
+
+### Two version tracks
+
+Changesets tracks the optional packages **only**, not the core. The root `package.json` (`zapo-js`) is the workspace anchor, so `@manypkg`/Changesets exclude it from the releasable set – `npx changeset add` does not even list it.
+
+- **Optional packages (`@zapo-js/*`)** – versioned with Changesets. Add a changeset in the PR that changes them: `npx changeset`, pick the packages and bump levels, write the summary. The file lands in `.changeset/`.
+- **Core (`zapo-js`)** – versioned by hand. Bump the root `version` directly with `npm version <patch|minor|major> --no-git-tag-version` (bumps the root only); Changesets never touches it. Its root `CHANGELOG.md` is likewise hand-maintained (see the release process below); `changeset version` only writes the add-on `packages/<name>/CHANGELOG.md` files, never the core's.
+
+### Release process (on `master`, before pushing the tag)
+
+1. List every commit since the last release and have the AI triage it. The input is `git log $(git describe --tags --match 'v*' --abbrev=0)..HEAD --stat`. Ask the AI to:
+    - attribute each commit to the **core** (`src/`) or an **add-on** (`packages/<name>/`) by the files it touched;
+    - propose the SemVer bump per area from the conventional-commit prefix – `feat` → minor, `fix`/`perf` → patch, a `!` marker or `BREAKING CHANGE` footer → major, and `chore`/`docs`/`ci`/`test`-only commits that ship no code → no bump (the highest wins per area);
+    - draft the changeset body for each touched add-on and the release-notes summary for the core.
+
+    The AI proposes; you decide.
+
+2. Write a changeset for every add-on the AI flagged that does not have one yet (`npx changeset`), then confirm with `npm run changeset:status`.
+3. Apply the add-on bumps + changelogs: `npm run version:packages` (runs `changeset version`, consumes the `.changeset/*.md`).
+4. Bump the core by hand if it changed, at the level the AI proposed: `npm version <level> --no-git-tag-version`.
+5. Update the root `CHANGELOG.md` by hand from the core release-notes summary in step 1: add a `## X.Y.Z` section above the previous version, grouping the core feats under `### Minor Changes` and the fixes under `### Patch Changes` (the Changesets style the file already uses). Omit `ci`/`docs`/`chore`-only commits. The add-on `CHANGELOG.md` files are already written by `changeset version` in step 3 – only the core's is hand-edited.
+6. Commit everything as one release commit: `chore: release vX.Y.Z`, where `X.Y.Z` is the core version. One commit carries the core version bump, the `CHANGELOG.md` entry, and the add-on changeset bumps together.
+7. Tag with the core version and push it: `git tag vX.Y.Z && git push && git push origin vX.Y.Z`.
+
+Pushing the `v*` tag triggers `.github/workflows/release.yml`, which publishes via npm trusted publishing (OIDC, no `NPM_TOKEN`): the core through a guarded `npm publish` (skipped when its version is already on the registry) and the add-ons through `changeset publish` (only the `@zapo-js/*` whose version is not yet on npm). `.github/workflows/github-release.yml` creates the GitHub Release from the same tag, with notes auto-generated from merged PRs (categories in `.github/release.yml`) – these are separate from, and not a replacement for, the hand-written root `CHANGELOG.md` from step 5.
+
+Every published package must be registered as a trusted publisher on npmjs.com (repo `vinikjkkj/zapo`, workflow `release.yml`) before its first CI publish. A brand new package name cannot be pre-configured – publish it once manually, then switch to trusted publishing.
+
+### Core major bumps and peer ranges
+
+Optional packages declare `zapo-js` as a `peerDependency` (`^1.0.0`). A core **major** bump (for example `1.x` → `2.0.0`) leaves that range unsatisfied: manually widen `peerDependencies.zapo-js` in every affected package and add a changeset for it, even with no code change of its own. Minor/patch core bumps stay within the range and need nothing.
 
 ---
 

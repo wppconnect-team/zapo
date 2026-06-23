@@ -25,6 +25,7 @@ import {
 import { WaGroupMetadataMemoryStore } from '@store/memory/group-metadata.store'
 import { WaMessageMemoryStore } from '@store/memory/message.store'
 import type { BinaryNode } from '@transport/types'
+import type { ServerClock } from '@util/clock'
 
 function fakeSyncImpl(impl: (options?: WaAppStateSyncOptions) => Promise<WaAppStateSyncResult>) {
     return {
@@ -110,7 +111,11 @@ function createMessageDispatchCoordinator(
     groupMetadataStore: WaGroupMetadataMemoryStore,
     overrides?: {
         readonly meJid?: string
-        readonly mobileMessageIdFormat?: boolean
+        readonly mobileMessageIdFormat?: () => boolean
+        readonly serverClock?: ServerClock
+        readonly deviceListStore?: {
+            readonly findByAnyUserJid: (jid: string) => Promise<unknown>
+        }
     }
 ): WaMessageDispatchCoordinator {
     const groupMetadataCache = createGroupMetadataCache({
@@ -133,7 +138,8 @@ function createMessageDispatchCoordinator(
         signalStore: {} as never,
         sessionStore: {} as never,
         identityStore: {} as never,
-        deviceListStore: {} as never,
+        deviceListStore: (overrides?.deviceListStore ?? {}) as never,
+        signalDeviceSync: {} as never,
         messageSecretStore: {
             set: async (_id: string, _entry: { secret: Uint8Array; senderJid: string }) => {}
         } as never,
@@ -141,7 +147,11 @@ function createMessageDispatchCoordinator(
             overrides?.meJid ? ({ meJid: overrides.meJid } as never) : null,
         resolvePrivacyTokenNode: async () => null,
         onDirectMessageSent: () => undefined,
-        mobileMessageIdFormat: overrides?.mobileMessageIdFormat
+        mobileMessageIdFormat: overrides?.mobileMessageIdFormat,
+        serverClock: overrides?.serverClock ?? {
+            nowMs: () => Date.now(),
+            nowSeconds: () => Math.floor(Date.now() / 1000)
+        }
     })
 }
 
@@ -157,6 +167,61 @@ function buildAppStateSyncResult(
     )
     return { collections }
 }
+
+function callResolvePeerRecipientPn(
+    coordinator: WaMessageDispatchCoordinator,
+    recipientUserJid: string,
+    directRecipientJid: string
+): Promise<string | undefined> {
+    return (
+        coordinator as unknown as {
+            resolvePeerRecipientPn(a: string, b: string): Promise<string | undefined>
+        }
+    ).resolvePeerRecipientPn(recipientUserJid, directRecipientJid)
+}
+
+test('resolvePeerRecipientPn: a PN-addressed caller on a LID envelope stamps that PN', async () => {
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore())
+    const pn = await callResolvePeerRecipientPn(
+        coordinator,
+        '5511999999999@s.whatsapp.net',
+        '88880000@lid'
+    )
+    assert.equal(pn, '5511999999999@s.whatsapp.net')
+})
+
+test('resolvePeerRecipientPn: a LID-addressed caller resolves the PN from the device-list store', async () => {
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        deviceListStore: {
+            findByAnyUserJid: async () => ({
+                userJid: '5511999999999@s.whatsapp.net',
+                altUserJid: '88880000@lid',
+                deviceJids: [],
+                updatedAtMs: 0
+            })
+        }
+    })
+    const pn = await callResolvePeerRecipientPn(coordinator, '88880000@lid', '88880000@lid')
+    assert.equal(pn, '5511999999999@s.whatsapp.net')
+})
+
+test('resolvePeerRecipientPn: a LID-addressed caller with a device-list miss drops the attribute', async () => {
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        deviceListStore: { findByAnyUserJid: async () => null }
+    })
+    const pn = await callResolvePeerRecipientPn(coordinator, '88880000@lid', '88880000@lid')
+    assert.equal(pn, undefined)
+})
+
+test('resolvePeerRecipientPn: a PN-addressed envelope stamps nothing', async () => {
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore())
+    const pn = await callResolvePeerRecipientPn(
+        coordinator,
+        '5511999999999@s.whatsapp.net',
+        '5511999999999@s.whatsapp.net'
+    )
+    assert.equal(pn, undefined)
+})
 
 test('incoming node coordinator supports dynamic handler registration and unregistration', async () => {
     const { runtime, unhandled } = createIncomingRuntime()
@@ -504,11 +569,11 @@ test('stream control handler runs force-login and resume flows', async () => {
         code: WA_STREAM_SIGNALING.FORCE_LOGIN_CODE
     })
 
-    assert.deepEqual(calls, ['stopComms', 'disconnect', 'clear_credentials', 'connect'])
+    assert.deepEqual(calls, ['stopComms', 'disconnect', 'connect'])
     assert.deepEqual(disconnectCalls, [
         {
             reason: WA_DISCONNECT_REASONS.STREAM_ERROR_FORCE_LOGIN,
-            isLogout: true,
+            isLogout: false,
             code: WA_STREAM_SIGNALING.FORCE_LOGIN_CODE
         }
     ])
@@ -735,7 +800,7 @@ test('mobile message id format: AC + 30 hex chars uppercase', async () => {
     const groupMetadataStore = new WaGroupMetadataMemoryStore(60_000)
     const coordinator = createMessageDispatchCoordinator(groupMetadataStore, {
         meJid: '5596965746475@s.whatsapp.net',
-        mobileMessageIdFormat: true
+        mobileMessageIdFormat: () => true
     })
     const gen = coordinator as unknown as {
         generateOutgoingMessageId(): Promise<string>
@@ -1322,6 +1387,45 @@ test('app-state mutation coordinator emits business_broadcast_list set/remove pa
     assert.deepEqual(JSON.parse(removeMutation.index), ['business_broadcast_list', 'list-1'])
 })
 
+test('app-state mutation coordinator routes applied SettingPushName to pushNameSink', () => {
+    const names: string[] = []
+    const coordinator = new WaAppStateMutationCoordinator({
+        serverClock: { nowMs: () => Date.now(), nowSeconds: () => Math.floor(Date.now() / 1000) },
+        logger: createNoopLogger(),
+        messageStore: new WaMessageMemoryStore(),
+        ...fakeSyncImpl(async () => ({ collections: [] })),
+        pushNameSink: (name) => {
+            names.push(name)
+        }
+    })
+
+    // Snapshot-source mutations still route to the sink (pair-time bootstrap).
+    coordinator.emitEventsFromSyncResult({
+        collections: [
+            {
+                collection: 'critical_block',
+                state: WA_APP_STATE_COLLECTION_STATES.SUCCESS,
+                mutations: [
+                    {
+                        collection: 'critical_block',
+                        operation: 'set',
+                        source: 'snapshot',
+                        index: JSON.stringify(['setting_pushName']),
+                        value: { pushNameSetting: { name: 'Maria' } },
+                        version: 1,
+                        indexMac: new Uint8Array(),
+                        valueMac: new Uint8Array(),
+                        keyId: new Uint8Array(),
+                        timestamp: 1_000
+                    }
+                ]
+            }
+        ]
+    })
+
+    assert.deepEqual(names, ['Maria'])
+})
+
 function createPassiveTasksCoordinator(overrides: {
     readonly takeDanglingReceipts: () => BinaryNode[]
     readonly sendNodeDirect: (node: BinaryNode) => Promise<void>
@@ -1340,7 +1444,7 @@ function createPassiveTasksCoordinator(overrides: {
             setSignedPreKey: async () => undefined,
             getSignedPreKeyById: async () => null,
             clear: async () => undefined
-        } as never,
+        },
         preKeyStore: {
             getServerHasPreKeys: async () => true,
             setServerHasPreKeys: async () => undefined,
@@ -1352,7 +1456,7 @@ function createPassiveTasksCoordinator(overrides: {
             consumePreKeyById: async () => null,
             markKeyAsUploaded: async () => undefined,
             clear: async () => undefined
-        } as never,
+        },
         signalDigestSync: {
             validateLocalKeyBundle: async () => ({ valid: true, preKeyCount: 10 })
         } as never,

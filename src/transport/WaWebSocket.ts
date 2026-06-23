@@ -422,16 +422,28 @@ export class WaWebSocket {
             handlers.onOpen()
         }
         entry.socket.onerror = () => {
-            this.logger.warn('socket open error', { url: entry.url })
+            if (entry.settled) {
+                this.logger.trace('settled pending socket error', { url: entry.url })
+            } else {
+                this.logger.warn('socket open error', { url: entry.url })
+            }
             handlers.onFail(new Error(`websocket connect error for ${entry.url}`))
         }
         entry.socket.onclose = (event) => {
             const info = this.toCloseInfo(event)
-            this.logger.warn('socket closed before open', {
-                url: entry.url,
-                code: info.code,
-                reason: info.reason
-            })
+            if (entry.settled) {
+                this.logger.trace('settled pending socket closed', {
+                    url: entry.url,
+                    code: info.code,
+                    reason: info.reason
+                })
+            } else {
+                this.logger.warn('socket closed before open', {
+                    url: entry.url,
+                    code: info.code,
+                    reason: info.reason
+                })
+            }
             handlers.onFail(
                 new Error(
                     `websocket closed before open (${info.code}:${info.reason}) for ${entry.url}`
@@ -501,8 +513,12 @@ export class WaWebSocket {
     private closeSocketSafe(socket: RawWebSocket, code: number, reason: string): void {
         try {
             socket.close(code, reason)
-        } catch {
-            // no-op
+        } catch (error) {
+            this.logger.trace('socket close ignored', {
+                code,
+                reason,
+                message: toError(error).message
+            })
         }
     }
 

@@ -188,7 +188,7 @@ async function buildPostgresStore(): Promise<BenchStoreFixture> {
             }
             recordCall(sql, start)
             return result
-        } as typeof c.query
+        }
     }
     const pool = !trace
         ? rawPool
@@ -200,7 +200,7 @@ async function buildPostgresStore(): Promise<BenchStoreFixture> {
                           return (target.connect as Function).call(
                               target,
                               (err: unknown, client: unknown, done: unknown) => {
-                                  if (client) wrapClient(client as object)
+                                  if (client) wrapClient(client)
                                   cb(err, client, done)
                               }
                           )
@@ -372,7 +372,7 @@ async function buildMysqlStore(): Promise<BenchStoreFixture> {
 
 async function buildRedisStore(): Promise<BenchStoreFixture> {
     const { createRedisStore } = await import('@zapo-js/store-redis')
-    const Redis = (await import('ioredis')).default
+    const { Redis } = await import('ioredis')
     const host = requireEnv('ZAPO_TEST_REDIS_HOST')
     const port = parsePort('ZAPO_TEST_REDIS_PORT')
     const keyPrefix = uniquePrefix('redis')

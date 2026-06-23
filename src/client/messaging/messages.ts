@@ -5,6 +5,7 @@ import {
     assertMediaUploadStatus,
     buildMediaUploadUrl,
     cleanupTempFile,
+    getScopedMediaLogger,
     hasMediaProcessingTasks,
     isReadableStream,
     parseMediaUploadJsonBody,
@@ -21,6 +22,7 @@ import { aesGcmEncrypt, randomBytesAsync, sha256 } from '@crypto'
 import type { Logger } from '@infra/log/types'
 import { MEDIA_CONN_CACHE_GRACE_MS, MEDIA_UPLOAD_PATHS } from '@media/constants'
 import { WaMediaCrypto } from '@media/crypto/WaMediaCrypto'
+import type { WaMediaProcessorCallContext } from '@media/processor'
 import { createStickerPackZipStream } from '@media/sticker/sticker-pack'
 import { parseMediaConnResponse } from '@media/transfer/conn'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
@@ -76,6 +78,7 @@ import { isBroadcastJid, isGroupJid, toUserJid } from '@protocol/jid'
 import { buildMediaConnIq } from '@transport/node/builders/media'
 import type { BinaryNode } from '@transport/types'
 import { bytesToBase64, TEXT_ENCODER, toBytesView } from '@util/bytes'
+import type { ServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 
 const VOICE_NOTE_MIMETYPE = 'audio/ogg; codecs=opus'
@@ -92,6 +95,7 @@ export interface WaMediaMessageOptions {
     ) => Promise<BinaryNode>
     readonly getMediaConnCache: () => WaMediaConn | null
     readonly setMediaConnCache: (mediaConn: WaMediaConn | null) => void
+    readonly serverClock: ServerClock
     readonly media?: WaMediaOptions
     readonly linkPreviewResolver?: (
         content: WaSendTextMessage
@@ -143,6 +147,7 @@ function targetMessageKey(remoteJid: string, key: WaMessageKey): Proto.IMessageK
 
 function buildReactionMessage(
     content: WaSendReactionMessage,
+    serverClock: ServerClock,
     ctx?: WaBuildMessageContext
 ): Proto.IMessage {
     requireCtxField(ctx, 'to', 'reaction')
@@ -150,7 +155,7 @@ function buildReactionMessage(
         reactionMessage: {
             key: targetMessageKey(ctx!.to, resolveMessageTarget(content.target)),
             text: content.emoji,
-            senderTimestampMs: content.senderTimestampMs ?? Date.now()
+            senderTimestampMs: content.senderTimestampMs ?? serverClock.nowMs()
         }
     }
 }
@@ -168,21 +173,38 @@ function buildRevokeMessage(
     }
 }
 
-function buildPinMessage(content: WaSendPinMessage, ctx?: WaBuildMessageContext): Proto.IMessage {
+// wa-web default pin expiry preset (24h). Receivers drop pins that arrive
+// without a duration, so always advertise one. Override via `durationSecs`.
+const WA_PIN_DEFAULT_DURATION_SECS = 86_400
+
+function buildPinMessage(
+    content: WaSendPinMessage,
+    serverClock: ServerClock,
+    ctx?: WaBuildMessageContext
+): Proto.IMessage {
     requireCtxField(ctx, 'to', content.type)
+    const isPin = content.type === 'pin'
     return {
         pinInChatMessage: {
             key: targetMessageKey(ctx!.to, resolveMessageTarget(content.target)),
-            type:
-                content.type === 'pin'
-                    ? proto.Message.PinInChatMessage.Type.PIN_FOR_ALL
-                    : proto.Message.PinInChatMessage.Type.UNPIN_FOR_ALL,
-            senderTimestampMs: content.senderTimestampMs ?? Date.now()
+            type: isPin
+                ? proto.Message.PinInChatMessage.Type.PIN_FOR_ALL
+                : proto.Message.PinInChatMessage.Type.UNPIN_FOR_ALL,
+            senderTimestampMs: content.senderTimestampMs ?? serverClock.nowMs()
+        },
+        messageContextInfo: {
+            messageAddOnDurationInSecs: isPin
+                ? (content.durationSecs ?? WA_PIN_DEFAULT_DURATION_SECS)
+                : 0
         }
     }
 }
 
-function buildKeepMessage(content: WaSendKeepMessage, ctx?: WaBuildMessageContext): Proto.IMessage {
+function buildKeepMessage(
+    content: WaSendKeepMessage,
+    serverClock: ServerClock,
+    ctx?: WaBuildMessageContext
+): Proto.IMessage {
     requireCtxField(ctx, 'to', content.type)
     return {
         keepInChatMessage: {
@@ -191,7 +213,7 @@ function buildKeepMessage(content: WaSendKeepMessage, ctx?: WaBuildMessageContex
                 content.type === 'keep'
                     ? proto.KeepType.KEEP_FOR_ALL
                     : proto.KeepType.UNDO_KEEP_FOR_ALL,
-            timestampMs: content.timestampMs ?? Date.now()
+            timestampMs: content.timestampMs ?? serverClock.nowMs()
         }
     }
 }
@@ -277,6 +299,7 @@ async function encryptAddonForOutgoing(input: {
 
 async function buildPollVoteMessage(
     content: WaSendPollVoteMessage,
+    serverClock: ServerClock,
     ctx?: WaBuildMessageContext
 ): Promise<Proto.IMessage> {
     requireCtxField(ctx, 'outgoingStanzaId', 'poll-vote')
@@ -305,20 +328,21 @@ async function buildPollVoteMessage(
                 content.poll.participant
             ),
             vote: { encPayload, encIv },
-            senderTimestampMs: content.senderTimestampMs ?? Date.now()
+            senderTimestampMs: content.senderTimestampMs ?? serverClock.nowMs()
         }
     }
 }
 
 async function buildEventResponseMessage(
     content: WaSendEventResponseMessage,
+    serverClock: ServerClock,
     ctx?: WaBuildMessageContext
 ): Promise<Proto.IMessage> {
     requireCtxField(ctx, 'outgoingStanzaId', 'event-response')
     requireCtxField(ctx, 'meJid', 'event-response')
     const responseProto: Proto.Message.IEventResponseMessage = {
         response: EVENT_RESPONSE_ENUM[content.response],
-        timestampMs: content.timestampMs ?? Date.now()
+        timestampMs: content.timestampMs ?? serverClock.nowMs()
     }
     if (content.extraGuestCount !== undefined) {
         responseProto.extraGuestCount = content.extraGuestCount
@@ -375,17 +399,23 @@ export async function buildMediaMessageContent(
         }
         return { message: { extendedTextMessage: { text: content.text } } }
     }
-    if (isSendReactionMessage(content)) return { message: buildReactionMessage(content, ctx) }
+    if (isSendReactionMessage(content)) {
+        return { message: buildReactionMessage(content, options.serverClock, ctx) }
+    }
     if (isSendRevokeMessage(content)) return { message: buildRevokeMessage(content, ctx) }
-    if (isSendPinMessage(content)) return { message: buildPinMessage(content, ctx) }
-    if (isSendKeepMessage(content)) return { message: buildKeepMessage(content, ctx) }
+    if (isSendPinMessage(content)) {
+        return { message: buildPinMessage(content, options.serverClock, ctx) }
+    }
+    if (isSendKeepMessage(content)) {
+        return { message: buildKeepMessage(content, options.serverClock, ctx) }
+    }
     if (isSendPollMessage(content)) return { message: buildPollCreationMessage(content) }
     if (isSendEventMessage(content)) return { message: buildEventMessage(content) }
     if (isSendPollVoteMessage(content)) {
-        return { message: await buildPollVoteMessage(content, ctx) }
+        return { message: await buildPollVoteMessage(content, options.serverClock, ctx) }
     }
     if (isSendEventResponseMessage(content)) {
-        return { message: await buildEventResponseMessage(content, ctx) }
+        return { message: await buildEventResponseMessage(content, options.serverClock, ctx) }
     }
     if (isSendMediaMessage(content)) {
         return buildMediaMessage(options, content)
@@ -424,19 +454,20 @@ function resolveUploadType(
 ): MediaCryptoType {
     if (content.type === 'video' && content.gifPlayback) return 'gif'
     if (content.type === 'audio' && content.ptt) return 'ptt'
-    return content.type as MediaCryptoType
+    return content.type
 }
 
 async function resolveMimetype(
     content: Exclude<WaSendMediaMessage, WaSendStickerPackMessage>,
     media: WaMediaOptions | undefined,
-    processorInput: string | Uint8Array | undefined
+    processorInput: string | Uint8Array | undefined,
+    ctx: WaMediaProcessorCallContext
 ): Promise<string> {
     if (content.mimetype) return content.mimetype
     if (content.type === 'sticker') return 'image/webp'
     const detect = media?.processor?.detectMimetype
     if (detect && processorInput !== undefined) {
-        const detected = await detect(processorInput)
+        const detected = await detect(processorInput, ctx)
         if (detected) return detected
     }
     throw new Error(
@@ -451,12 +482,17 @@ async function buildMediaMessage(
     if (content.type === 'sticker-pack') {
         return buildStickerPackMediaMessage(options, content)
     }
+    const processorCtx: WaMediaProcessorCallContext = {
+        logger: getScopedMediaLogger(options.logger)
+    }
     if (shouldNormalizeVoiceNote(options.media, content)) {
         const sourceInput =
             content.media instanceof ArrayBuffer ? toBytesView(content.media) : content.media
         try {
-            const normalizedStream =
-                await options.media!.processor!.normalizeVoiceNote!(sourceInput)
+            const normalizedStream = await options.media!.processor!.normalizeVoiceNote!(
+                sourceInput,
+                processorCtx
+            )
             if (normalizedStream) {
                 content = { ...content, media: normalizedStream, mimetype: VOICE_NOTE_MIMETYPE }
             }
@@ -476,7 +512,12 @@ async function buildMediaMessage(
         (content.type === 'sticker' && content.firstFrameLength === undefined) ||
         needsMimetypeDetection
     const resolved = await resolveMediaInputs(needsTempFile, content.media)
-    const mimetype = await resolveMimetype(content, options.media, resolved.processorInput)
+    const mimetype = await resolveMimetype(
+        content,
+        options.media,
+        resolved.processorInput,
+        processorCtx
+    )
 
     try {
         let detectedFirstFrameLength: number | undefined
@@ -512,7 +553,7 @@ async function buildMediaMessage(
         if (processResult.status === 'rejected') throw processResult.reason
         const uploaded = uploadResult.value
         const processed = processResult.value
-        const mediaKeyTimestamp = Math.floor(Date.now() / 1000)
+        const mediaKeyTimestamp = options.serverClock.nowSeconds()
         const uploadedFields = {
             url: uploaded.url,
             fileSha256: uploaded.fileSha256,
@@ -634,7 +675,7 @@ async function buildMediaMessage(
                             firstFrameLength: content.firstFrameLength ?? uploaded.firstFrameLength,
                             firstFrameSidecar:
                                 content.firstFrameSidecar ?? uploaded.firstFrameSidecar,
-                            stickerSentTs: content.stickerSentTs ?? Date.now()
+                            stickerSentTs: content.stickerSentTs ?? options.serverClock.nowMs()
                         }
                     }
                 }
@@ -890,7 +931,7 @@ async function buildStickerPackMediaMessage(
                 fileSha256: bundle.fileSha256,
                 fileEncSha256: bundle.fileEncSha256,
                 mediaKey,
-                mediaKeyTimestamp: Math.floor(Date.now() / 1000),
+                mediaKeyTimestamp: options.serverClock.nowSeconds(),
                 directPath: bundle.directPath,
                 thumbnailDirectPath: cover.directPath,
                 thumbnailSha256: cover.fileSha256,

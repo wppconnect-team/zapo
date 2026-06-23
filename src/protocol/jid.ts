@@ -85,6 +85,11 @@ export function isLidJid(jid: string): boolean {
     return isJidType(jid, WA_DEFAULTS.LID_SERVER)
 }
 
+/** Returns `true` for JIDs in the `@s.whatsapp.net` server (phone-number user JIDs). */
+export function isUserJid(jid: string): boolean {
+    return isJidType(jid, WA_DEFAULTS.HOST_DOMAIN)
+}
+
 /** Returns `true` for JIDs in the `@bot` server. */
 export function isBotJid(jid: string): boolean {
     return isJidType(jid, WA_DEFAULTS.BOT_SERVER)
@@ -214,6 +219,55 @@ export function toUserJid(
           )
         : address.server
     return `${address.user}@${server}`
+}
+
+/**
+ * True when `jid` is the account's own user, matching the `meJid` (pn) or
+ * `meLid` (lid) identity device-insensitively. Mirrors WhatsApp Web's
+ * `isMeAccount`.
+ */
+export function isOwnAccountJid(
+    jid: string,
+    meJid: string | null | undefined,
+    meLid: string | null | undefined
+): boolean {
+    const candidateUser = toUserJid(jid)
+    return (
+        (!!meJid && toUserJid(meJid) === candidateUser) ||
+        (!!meLid && toUserJid(meLid) === candidateUser)
+    )
+}
+
+/**
+ * Rewrites the account's own PN device JID to its LID equivalent so self traffic
+ * keys one LID session instead of forking into separate PN and LID ratchets.
+ * No-op for other users, already-LID/unparseable JIDs, or unknown identity.
+ */
+export function canonicalizeOwnAccountJid(
+    jid: string,
+    meJid: string | null | undefined,
+    meLid: string | null | undefined
+): string {
+    if (!meJid || !meLid) return jid
+    let address: SignalAddress
+    try {
+        address = parseSignalAddressFromJid(jid)
+    } catch {
+        return jid
+    }
+    if ((address.server ?? WA_DEFAULTS.HOST_DOMAIN) !== WA_DEFAULTS.HOST_DOMAIN) return jid
+    let mePnUser: string
+    let meLidUser: string
+    try {
+        mePnUser = parseSignalAddressFromJid(meJid).user
+        meLidUser = parseSignalAddressFromJid(meLid).user
+    } catch {
+        return jid
+    }
+    if (address.user !== mePnUser) return jid
+    return address.device === 0
+        ? `${meLidUser}@${WA_DEFAULTS.LID_SERVER}`
+        : `${meLidUser}:${address.device}@${WA_DEFAULTS.LID_SERVER}`
 }
 
 /**

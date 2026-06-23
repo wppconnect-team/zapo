@@ -1,9 +1,14 @@
 {
     "name": "@zapo-js/store-sqlite",
-    "version": "0.3.0",
+    "version": "1.0.1",
     "description": "SQLite store provider for zapo-js",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vinikjkkj/zapo.git",
+        "directory": "packages/store-sqlite"
+    },
     "main": "dist/index.js",
     "module": "dist/esm/index.js",
     "types": "dist/index.d.ts",
@@ -27,13 +32,8 @@
         "test": "node --import tsx --test \"src/**/__tests__/**/*.test.ts\""
     },
     "peerDependencies": {
-        "zapo-js": ">=0.1.0",
+        "zapo-js": "^1.0.0",
         "better-sqlite3": ">=11.0.0"
-    },
-    "peerDependenciesMeta": {
-        "zapo-js": {
-            "optional": true
-        }
     },
     "devDependencies": {
         "better-sqlite3": "^12.6.2",
