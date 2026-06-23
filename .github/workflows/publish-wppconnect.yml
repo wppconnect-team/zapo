@@ -1,7 +1,7 @@
 name: Publish @wppconnect/zapo
 
-# Publishes the ROOT package of this fork to npm as @wppconnect/zapo from the
-# publish branch.
+# Publishes the ROOT package of this fork to npm as @wppconnect/zapo via OIDC
+# trusted publishing.
 #
 # NOTE: zapo is a monorepo (workspaces: packages/*). Only the root client
 # package is published here (as @wppconnect/zapo) with --workspaces=false; the
@@ -13,7 +13,7 @@ name: Publish @wppconnect/zapo
 # place package.json carries the scoped name + the fork's repository url — which
 # OIDC provenance REQUIRES to match the GitHub repo.
 #
-# Auth: GitHub Actions secret NPM_TOKEN.
+# Auth: OIDC trusted publishing. No long-lived NPM_TOKEN secret is required.
 
 on:
   push:
@@ -22,6 +22,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  id-token: write
   contents: read
 
 jobs:
@@ -47,8 +48,6 @@ jobs:
         run: npm run build
 
       - name: Publish root package to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           NAME=$(node -p "require('./package.json').name")
           VERSION=$(node -p "require('./package.json').version")
