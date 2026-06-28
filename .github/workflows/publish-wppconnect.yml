@@ -20,45 +20,45 @@ name: Publish @wppconnect/zapo
 # workflow. No NPM_TOKEN secret needed.
 
 on:
-  push:
-    tags:
-      - 'wpp-v*'
+    push:
+        tags:
+            - 'wpp-v*'
 
 permissions:
-  id-token: write
-  contents: read
+    id-token: write
+    contents: read
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    publish:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: 'https://registry.npmjs.org'
+            - name: Setup Node
+              uses: actions/setup-node@v6
+              with:
+                  node-version: 22
+                  registry-url: 'https://registry.npmjs.org'
 
-      - name: Install dependencies
-        run: npm ci || npm install
+            - name: Install dependencies
+              run: npm ci || npm install
 
-      - name: Build (root package)
-        run: npm run build
+            - name: Build (root package)
+              run: npm run build
 
-      - name: Apply @wppconnect scope (runner only, not committed)
-        run: |
-          VERSION="${GITHUB_REF_NAME#wpp-v}"
-          npm pkg set name='@wppconnect/zapo'
-          npm pkg set version="${VERSION}"
-          npm pkg set 'publishConfig.access'='public'
-          echo "Publishing @wppconnect/zapo@${VERSION} (root package only)"
+            - name: Apply @wppconnect scope (runner only, not committed)
+              run: |
+                  VERSION="${GITHUB_REF_NAME#wpp-v}"
+                  npm pkg set name='@wppconnect/zapo'
+                  npm pkg set version="${VERSION}"
+                  npm pkg set 'publishConfig.access'='public'
+                  echo "Publishing @wppconnect/zapo@${VERSION} (root package only)"
 
-      - name: Publish root package to npm
-        run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-alpha"* || "${GITHUB_REF_NAME}" == *"-rc"* || "${GITHUB_REF_NAME}" == *"-beta"* ]]; then
-            npm publish --provenance --access public --tag next --workspaces=false
-          else
-            npm publish --provenance --access public --workspaces=false
-          fi
+            - name: Publish root package to npm
+              run: |
+                  if [[ "${GITHUB_REF_NAME}" == *"-alpha"* || "${GITHUB_REF_NAME}" == *"-rc"* || "${GITHUB_REF_NAME}" == *"-beta"* ]]; then
+                    npm publish --provenance --access public --tag next --workspaces=false
+                  else
+                    npm publish --provenance --access public --workspaces=false
+                  fi
