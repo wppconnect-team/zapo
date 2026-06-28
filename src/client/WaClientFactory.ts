@@ -99,7 +99,12 @@ import {
     WA_NOTIFICATION_TYPES,
     WA_PRIVACY_TOKEN_NOTIFICATION_TYPE
 } from '@protocol/constants'
-import { isNewsletterJid, parseSignalAddressFromJid, toUserJid } from '@protocol/jid'
+import {
+    isNewsletterJid,
+    isOwnAccountJid,
+    parseSignalAddressFromJid,
+    toUserJid
+} from '@protocol/jid'
 import { WA_PRESENCE_TYPES } from '@protocol/presence'
 import type { WaConnectionCode, WaConnectionOpenReason, WaDisconnectReason } from '@protocol/stream'
 import { createOutboundRetryTracker } from '@retry/tracker'
@@ -113,6 +118,7 @@ import { SignalSessionSyncApi } from '@signal/api/SignalSessionSyncApi'
 import { SenderKeyManager } from '@signal/group/SenderKeyManager'
 import { createSignalSessionResolver } from '@signal/session/resolver'
 import { SignalProtocol } from '@signal/session/SignalProtocol'
+import type { WaStoredContactRecord } from '@store/contracts/contact.store'
 import { WaKeepAlive } from '@transport/keepalive/WaKeepAlive'
 import { buildAckNode } from '@transport/node/builders/global'
 import { buildPresenceNode } from '@transport/node/builders/presence'
@@ -162,6 +168,13 @@ interface WaClientBuildRuntime {
     readonly subscribeProtocolMessage: (
         handler: (event: WaIncomingProtocolMessageEvent) => void
     ) => () => void
+    /**
+     * Sink for address-book contact rows synced over app-state. Wired by
+     * `WaClient` to {@link WriteBehindPersistence.persistContact} so Contact
+     * mutations land in the contact store at pair-time (snapshot) and on
+     * every incremental sync.
+     */
+    readonly persistContact: (record: WaStoredContactRecord) => void
 }
 
 export interface WaClientDependencies {
@@ -355,7 +368,8 @@ function createIncomingNodeRuntime(input: {
         emitRegistrationCode: (event) => emitEvent('mobile_registration_code', event),
         emitAccountTakeoverNotice: (event) => emitEvent('mobile_account_takeover_notice', event),
         emitGroupEvent: (event) => {
-            emitEvent('group', event)
+            // Register the cache mutation before emitting so a handler that
+            // sends synchronously sees the fresh participants, not the stale ones.
             void messageDispatch.mutateGroupMetadataCacheFromGroupEvent(event).catch((error) => {
                 logger.warn('failed to mutate group metadata cache from group event', {
                     action: event.action,
@@ -364,6 +378,7 @@ function createIncomingNodeRuntime(input: {
                     message: toError(error).message
                 })
             })
+            emitEvent('group', event)
         },
         emitBusinessEvent: (event) => emitEvent('business', event),
         emitPictureEvent: (event) => emitEvent('picture', event),
@@ -447,7 +462,7 @@ export function buildWaClientDependencies(input: {
         logger,
         defaultTimeoutMs: options.nodeQueryTimeoutMs,
         hostDomain: WA_DEFAULTS.HOST_DOMAIN,
-        mobileIqIdFormat: options.mobileTransport !== undefined
+        mobileIqIdFormat: () => isMobilePrimary()
     })
     const keepAlive = new WaKeepAlive({
         logger,
@@ -495,6 +510,7 @@ export function buildWaClientDependencies(input: {
             mediaConnCacheFallback = mediaConn
             connectionManager?.setMediaConnCache(mediaConn)
         },
+        serverClock,
         media: options.media,
         linkPreviewResolver: (content) =>
             resolveLinkPreview(content.text, content.linkPreview, {
@@ -502,7 +518,8 @@ export function buildWaClientDependencies(input: {
                 mediaTransfer,
                 getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
                 fetcher: linkPreviewFetcher,
-                options: linkPreviewOptions
+                options: linkPreviewOptions,
+                serverClock
             })
     }
 
@@ -604,6 +621,9 @@ export function buildWaClientDependencies(input: {
     )
 
     const getCurrentCredentials = authClient.getCurrentCredentials.bind(authClient)
+
+    const isMobilePrimary = (): boolean =>
+        options.mobileTransport !== undefined || Boolean(getCurrentCredentials()?.deviceInfo)
 
     const groupCoordinator = createGroupCoordinator({
         queryWithContext: runtime.queryWithContext,
@@ -728,7 +748,9 @@ export function buildWaClientDependencies(input: {
         sessionStore: sessionStore.session,
         identityStore: sessionStore.identity,
         deviceListStore: sessionStore.deviceList,
+        signalDeviceSync,
         messageSecretStore: sessionStore.messageSecret,
+        persistAllMessageSecrets: options.addons?.persistAllSecrets === true,
         getCurrentCredentials,
         resolvePrivacyTokenNode: (recipientJid) =>
             trustedContactToken.resolveTokenForMessage(recipientJid),
@@ -747,12 +769,14 @@ export function buildWaClientDependencies(input: {
                 additionalAttributes: sendOptions.additionalAttributes
             }),
         getIcdcHashLength: () => abPropsCoordinator.getConfigValue('md_icdc_hash_length'),
-        mobileMessageIdFormat: options.mobileTransport !== undefined
+        mobileMessageIdFormat: isMobilePrimary,
+        serverClock
     })
 
     const presenceCoordinator = createPresenceCoordinator({
         sendNode: (node) => nodeOrchestrator.sendNode(node, false),
-        getCurrentCredentials
+        getCurrentCredentials,
+        resolvePrivacyTokenNode: (jid) => trustedContactToken.resolveReceiverTokenNode(jid)
     })
 
     const peerDataOperation = createPeerDataOperationRequester({
@@ -791,12 +815,16 @@ export function buildWaClientDependencies(input: {
         sendNode: runtime.sendNode,
         getCurrentCredentials,
         resolveUserIcdc: (userJid) => messageDispatch.resolveUserIcdc(userJid),
+        resolvePrivacyTokenNode: (recipientJid) =>
+            trustedContactToken.resolveTokenForMessage(recipientJid),
+        // Placeholder resend asks the primary phone (a peer) for the plaintext.
         peerDataOperation,
         emitIncomingMessage: (event) => {
             void runtime
                 .handleIncomingMessageEvent(event)
                 .catch((err) => runtime.handleError(toError(err)))
-        }
+        },
+        isMobilePrimary
     })
 
     const botCoordinator = createBotCoordinator({
@@ -824,15 +852,11 @@ export function buildWaClientDependencies(input: {
             await messageDispatch.requestAppStateSyncKeys(keyIds)
         },
         skipMacVerification: options.dangerous?.disableAppStateMacVerification,
-        mobilePrimary: options.mobileTransport !== undefined,
+        mobilePrimary: isMobilePrimary,
         isOwnAccountDevice: (deviceJid) => {
             const credentials = getCurrentCredentials()
             if (!credentials) return false
-            const candidateUser = toUserJid(deviceJid)
-            return (
-                (!!credentials.meJid && toUserJid(credentials.meJid) === candidateUser) ||
-                (!!credentials.meLid && toUserJid(credentials.meLid) === candidateUser)
-            )
+            return isOwnAccountJid(deviceJid, credentials.meJid, credentials.meLid)
         },
         sendKeyShare: (toDeviceJid, keys, missingKeyIds) =>
             messageDispatch.sendAppStateSyncKeyShare(toDeviceJid, keys, missingKeyIds),
@@ -840,6 +864,19 @@ export function buildWaClientDependencies(input: {
             await runtime.syncAppState()
         }
     })
+
+    // Persists a pushName change and re-broadcasts presence carrying it (how the
+    // name reaches peers on primary connections). No-op when unchanged, which
+    // also collapses the app-state echo of our own SettingPushName write.
+    const applyOwnPushName = async (name: string): Promise<void> => {
+        if (getCurrentCredentials()?.meDisplayName === name) {
+            return
+        }
+        await authClient.persistSuccessAttributes({ meDisplayName: name })
+        if (connectionManager?.isConnected()) {
+            await presenceCoordinator.send()
+        }
+    }
 
     const appStateMutations = new WaAppStateMutationCoordinator({
         logger,
@@ -850,7 +887,15 @@ export function buildWaClientDependencies(input: {
         serverClock,
         emitSnapshotMutations: options.chatEvents?.emitSnapshotMutations === true,
         emitMutation: (event) => runtime.emitEvent('mutation', event),
-        nctSaltSink: (salt) => trustedContactToken.handleNctSaltSync(salt)
+        nctSaltSink: (salt) => trustedContactToken.handleNctSaltSync(salt),
+        contactSink: runtime.persistContact,
+        pushNameSink: (name) => {
+            void applyOwnPushName(name).catch((error) =>
+                logger.debug('apply own pushName from app-state sync failed', {
+                    message: toError(error).message
+                })
+            )
+        }
     })
 
     const profileCoordinator = createProfileCoordinator({
@@ -859,6 +904,8 @@ export function buildWaClientDependencies(input: {
         mexSocket: { query: runtime.query },
         queryLidsByPhoneJids: (phoneJids) => signalDeviceSync.queryLidsByPhoneJids(phoneJids),
         mutations: appStateMutations,
+        applyOwnPushName,
+        resolvePrivacyTokenNode: (jid) => trustedContactToken.resolveReceiverTokenNode(jid),
         logger
     })
 
@@ -954,6 +1001,7 @@ export function buildWaClientDependencies(input: {
         logger,
         sendNode: runtime.sendNode,
         getMeJid: () => getCurrentCredentials()?.meJid,
+        getMeLid: () => getCurrentCredentials()?.meLid,
         signalProtocol,
         senderKeyManager,
         onDecryptFailure: (context: WaRetryDecryptFailureContext, error: unknown) =>
@@ -965,6 +1013,7 @@ export function buildWaClientDependencies(input: {
         },
         emitNewsletterMessageUpdate: (event) =>
             runtime.emitEvent('newsletter_message_update', event),
+        emitUnavailableMessage: (event) => runtime.emitEvent('message_unavailable', event),
         emitUnhandledStanza: (event: WaIncomingUnhandledStanzaEvent) =>
             runtime.emitEvent('debug_unhandled_stanza', event)
     }
@@ -1316,7 +1365,7 @@ export function buildWaClientDependencies(input: {
             abPropsCoordinator,
             markOnlineOnConnect: options.markOnlineOnConnect ?? false
         }),
-        mobilePrimary: options.mobileTransport !== undefined,
+        mobilePrimary: isMobilePrimary,
         appStateSync
     })
 

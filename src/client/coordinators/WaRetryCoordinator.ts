@@ -1,12 +1,14 @@
 import type { WaAuthCredentials } from '@auth/types'
 import type { WaIncomingMessageEvent } from '@client/types'
+import { toRawPubKey } from '@crypto/core/keys'
 import type { Logger } from '@infra/log/types'
+import { BoundedTaskQueue, BoundedTaskQueueFullError } from '@infra/perf/BoundedTaskQueue'
 import type { IcdcMeta } from '@message/crypto/icdc'
 import { buildRecoveredIncomingEvent } from '@message/primitives/incoming'
 import type { PeerDataOperationRequester } from '@message/primitives/peer-data-operation'
 import type { WaMessageClient } from '@message/WaMessageClient'
 import { proto } from '@proto'
-import { WA_MESSAGE_TAGS, WA_MESSAGE_TYPES } from '@protocol/constants'
+import { WA_MESSAGE_TAGS, WA_MESSAGE_TYPES, WA_NACK_REASONS } from '@protocol/constants'
 import {
     isGroupOrBroadcastJid,
     isHostedDeviceJid,
@@ -67,6 +69,21 @@ interface WaRetryCoordinatorOptions {
     readonly resolveUserIcdc?: (userJid: string) => Promise<IcdcMeta | null>
     readonly peerDataOperation?: PeerDataOperationRequester
     readonly emitIncomingMessage?: (event: WaIncomingMessageEvent) => void
+    /**
+     * Placeholder resend asks the primary phone (a peer) for the plaintext. A
+     * mobile primary is itself the phone and has no peer to ask, so when this
+     * resolves true the coordinator skips the resend and falls back to plain
+     * retry receipts. Resolved per failure (post-connect, after credentials
+     * load) so a registered mobile session reconnecting without an explicit
+     * `mobileTransport` option still takes the fallback path.
+     */
+    readonly isMobilePrimary?: () => boolean
+    /**
+     * Resolves the trusted-contact (privacy) token node for a recipient user
+     * jid: retry resends must carry the same `<tctoken>` the original send did,
+     * or privacy-gated recipients nack them with error 463.
+     */
+    readonly resolvePrivacyTokenNode?: (recipientJid: string) => Promise<BinaryNode | null>
 }
 
 type RetryAuthorization =
@@ -91,6 +108,11 @@ interface RetryResendPreparation {
 
 const RETRY_CLEANUP_INTERVAL_MS = 30_000
 const RETRY_SESSION_BASE_KEY_CACHE_MAX_ENTRIES = 8_192
+
+// Decrypt-failure handling runs off the inbound pipeline (keys-section builds
+// serialize on the prekey lock and hit the store); excess under flood is dropped.
+const DECRYPT_FAILURE_QUEUE_MAX_SIZE = 1_024
+const DECRYPT_FAILURE_QUEUE_MAX_CONCURRENCY = 8
 
 const PLACEHOLDER_RESEND_RETRY_THRESHOLD = 3
 const PLACEHOLDER_RESEND_BATCH_SIZE = 32
@@ -147,6 +169,7 @@ export class WaRetryCoordinator {
     private readonly placeholderInFlight: Set<string> = new Set()
     private placeholderQueue: PlaceholderResendQueueItem[] = []
     private placeholderTimer: ReturnType<typeof setTimeout> | null = null
+    private readonly decryptFailureQueue: BoundedTaskQueue
 
     public constructor(options: WaRetryCoordinatorOptions) {
         this.deps = options
@@ -157,26 +180,57 @@ export class WaRetryCoordinator {
             signalProtocol: options.signalProtocol,
             sessionResolver: options.sessionResolver,
             getCurrentCredentials: options.getCurrentCredentials,
-            resolveUserIcdc: options.resolveUserIcdc
+            resolveUserIcdc: options.resolveUserIcdc,
+            resolvePrivacyTokenNode: options.resolvePrivacyTokenNode
         })
         this.retryProcessingByMessageId = new Map()
         this.retrySessionBaseKeys = new Map()
+        this.decryptFailureQueue = new BoundedTaskQueue(
+            DECRYPT_FAILURE_QUEUE_MAX_SIZE,
+            DECRYPT_FAILURE_QUEUE_MAX_CONCURRENCY
+        )
     }
 
-    public async onDecryptFailure(
+    public onDecryptFailure(
         context: WaRetryDecryptFailureContext,
         error: unknown
     ): Promise<boolean> {
+        // Deferred to the bounded queue: building the receipt inline would stall
+        // the inbound node pipeline.
+        void this.decryptFailureQueue
+            .enqueue(() => this.handleDecryptFailure(context, error))
+            .catch((queueError) => {
+                if (queueError instanceof BoundedTaskQueueFullError) {
+                    this.deps.logger.warn('decrypt-failure retry dropped: queue saturated', {
+                        id: context.stanzaId,
+                        from: context.from,
+                        participant: context.participant
+                    })
+                    return
+                }
+                this.deps.logger.warn('failed to schedule decrypt-failure retry', {
+                    id: context.stanzaId,
+                    from: context.from,
+                    participant: context.participant,
+                    message: toError(queueError).message
+                })
+            })
+        return Promise.resolve(true)
+    }
+
+    private async handleDecryptFailure(
+        context: WaRetryDecryptFailureContext,
+        error: unknown
+    ): Promise<void> {
         try {
             const prepared = await this.prepareDecryptFailureRetry(context, error)
-            if (!prepared) {
-                return false
+            if (prepared && !prepared.delegatedToPlaceholderResend) {
+                await this.sendDecryptFailureRetryReceipt(context, prepared)
             }
-            if (prepared.delegatedToPlaceholderResend) {
-                return true
-            }
-            await this.sendDecryptFailureRetryReceipt(context, prepared)
-            return true
+            // Ack the failed stanza even on the give-up path: the retry receipt
+            // asks for a resend but does not consume the message, so without the
+            // ack it is redelivered on every offline resume.
+            await this.sendDecryptFailureAck(context)
         } catch (sendError) {
             this.deps.logger.warn('failed to send retry receipt for decrypt failure', {
                 id: context.stanzaId,
@@ -184,7 +238,6 @@ export class WaRetryCoordinator {
                 participant: context.participant,
                 message: toError(sendError).message
             })
-            return false
         }
     }
 
@@ -259,6 +312,17 @@ export class WaRetryCoordinator {
             nowMs,
             expiresAtMs
         )
+        if (retryCount > MAX_RETRY_ATTEMPTS) {
+            // Give up past the ceiling: each attempt rebuilds an expensive keys
+            // section, so an uncapped retry on redelivered backlog hammers the store.
+            this.deps.logger.debug('retry receipt skipped: inbound retry limit exceeded', {
+                id: context.stanzaId,
+                from: context.from,
+                participant: context.participant,
+                retryCount
+            })
+            return null
+        }
         const delegatedToPlaceholderResend =
             retryCount >= PLACEHOLDER_RESEND_RETRY_THRESHOLD &&
             this.enqueuePlaceholderResend(context)
@@ -278,9 +342,10 @@ export class WaRetryCoordinator {
             retryCount,
             retryKeys:
                 forceKeysForHosted || retryCount >= RETRY_KEYS_MIN_COUNT
-                    ? ((await this.buildRetryKeysSection(
-                          registrationInfo.identityKeyPair.pubKey
-                      )) ?? undefined)
+                    ? ((await this.buildRetryKeysSection(registrationInfo.identityKeyPair.pubKey, {
+                          stanzaId: context.stanzaId,
+                          from: context.from
+                      })) ?? undefined)
                     : undefined,
             retryReason: mapRetryReasonFromError(error),
             timestamp: context.t ?? String(Math.trunc(nowMs / 1000)),
@@ -292,7 +357,7 @@ export class WaRetryCoordinator {
         context: WaRetryDecryptFailureContext,
         prepared: RetryDecryptFailurePreparation
     ): Promise<void> {
-        const recipient = context.recipient ?? this.resolvePeerRetryRecipient(context)
+        const { recipient } = context
         const retryReceiptNode = buildRetryReceiptNode({
             stanzaId: context.stanzaId,
             to: context.from,
@@ -307,7 +372,7 @@ export class WaRetryCoordinator {
             keys: prepared.retryKeys
         })
         await this.deps.sendNode(retryReceiptNode)
-        this.deps.logger.debug('sent retry receipt for decrypt failure', {
+        this.deps.logger.trace('sent retry receipt for decrypt failure', {
             id: context.stanzaId,
             to: context.from,
             participant: context.participant,
@@ -318,23 +383,34 @@ export class WaRetryCoordinator {
         })
     }
 
-    private resolvePeerRetryRecipient(context: WaRetryDecryptFailureContext): string | undefined {
-        if (!context.participant) {
-            return undefined
-        }
-        const meLid = this.deps.getCurrentCredentials()?.meLid
-        if (!meLid) {
-            return undefined
+    private async sendDecryptFailureAck(context: WaRetryDecryptFailureContext): Promise<void> {
+        if (!context.stanzaId || !context.from) {
+            return
         }
         try {
-            const participantUser = toUserJid(context.participant)
-            const meUserLid = toUserJid(meLid)
-            if (participantUser !== meUserLid) {
-                return undefined
-            }
-            return meUserLid
-        } catch {
-            return undefined
+            await this.deps.sendNode(
+                buildAckNode({
+                    kind: 'message',
+                    node: context.messageNode,
+                    id: context.stanzaId,
+                    to: context.from,
+                    participant: context.participant,
+                    from: this.deps.getCurrentCredentials()?.meJid ?? undefined,
+                    error: WA_NACK_REASONS.UNHANDLED_ERROR
+                })
+            )
+            this.deps.logger.trace('acked undecryptable stanza', {
+                id: context.stanzaId,
+                from: context.from,
+                participant: context.participant
+            })
+        } catch (error) {
+            this.deps.logger.warn('failed to ack undecryptable stanza', {
+                id: context.stanzaId,
+                from: context.from,
+                participant: context.participant,
+                message: toError(error).message
+            })
         }
     }
 
@@ -343,7 +419,7 @@ export class WaRetryCoordinator {
         request: WaParsedRetryRequest
     ): Promise<void> {
         if (request.type === WA_MESSAGE_TYPES.RECEIPT_TYPE_ENC_REKEY_RETRY) {
-            this.deps.logger.info('received enc_rekey_retry request (voip path deferred)', {
+            this.deps.logger.debug('received enc_rekey_retry request (voip path deferred)', {
                 id: request.stanzaId,
                 originalMsgId: request.originalMsgId,
                 from: request.from,
@@ -364,25 +440,24 @@ export class WaRetryCoordinator {
         if (!prepared) {
             return
         }
+        const requestLogger = this.deps.logger.child({
+            id: request.stanzaId,
+            originalMsgId: request.originalMsgId,
+            requester: prepared.requesterJid
+        })
         const resendResult = await this.retryReplayService.resendOutboundMessage(
             prepared.outbound,
             prepared.requesterJid,
             request.retryCount
         )
         if (resendResult === 'ineligible') {
-            this.deps.logger.info('retry request marked ineligible for resend', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: prepared.requesterJid,
+            requestLogger.debug('retry request marked ineligible for resend', {
                 mode: prepared.outbound.replayMode
             })
             return
         }
 
-        this.deps.logger.info('retry request processed and resent', {
-            id: request.stanzaId,
-            originalMsgId: request.originalMsgId,
-            requester: prepared.requesterJid,
+        requestLogger.debug('retry request processed and resent', {
             mode: prepared.outbound.replayMode,
             remoteRetryCount: request.retryCount,
             ...getRemoteRetryReasonLogFields(request.retryReason)
@@ -392,14 +467,16 @@ export class WaRetryCoordinator {
     private async prepareRetryResend(
         request: WaParsedRetryRequest
     ): Promise<RetryResendPreparation | null> {
+        const requestLogger = this.deps.logger.child({
+            id: request.stanzaId,
+            originalMsgId: request.originalMsgId
+        })
         const requesterJid = request.participant ?? request.from ?? null
         if (!requesterJid) {
-            this.deps.logger.warn('retry request ignored: missing requester jid', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId
-            })
+            requestLogger.warn('retry request ignored: missing requester jid')
             return null
         }
+        const requesterLogger = requestLogger.child({ requester: requesterJid })
         let requesterAddress: ReturnType<typeof parseSignalAddressFromJid>
         let requesterNormalizedDeviceJid: string
         try {
@@ -407,20 +484,14 @@ export class WaRetryCoordinator {
             requesterAddress = requesterParsed.address
             requesterNormalizedDeviceJid = requesterParsed.normalizedJid
         } catch (error) {
-            this.deps.logger.info('retry request rejected: invalid requester jid', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: requesterJid,
+            requesterLogger.debug('retry request rejected: invalid requester jid', {
                 message: toError(error).message
             })
             return null
         }
 
         if (request.retryCount >= MAX_RETRY_ATTEMPTS) {
-            this.deps.logger.info('retry request rejected: retry count exceeded', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: requesterJid,
+            requesterLogger.debug('retry request rejected: retry count exceeded', {
                 remoteRetryCount: request.retryCount,
                 ...getRemoteRetryReasonLogFields(request.retryReason)
             })
@@ -429,11 +500,7 @@ export class WaRetryCoordinator {
 
         const outbound = await this.deps.retryStore.getOutboundMessage(request.originalMsgId)
         if (!outbound) {
-            this.deps.logger.info('retry request ignored: outbound message not found', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: requesterJid
-            })
+            requesterLogger.debug('retry request ignored: outbound message not found')
             return null
         }
 
@@ -444,10 +511,7 @@ export class WaRetryCoordinator {
             requesterNormalizedDeviceJid
         )
         if (!sessionReady) {
-            this.deps.logger.info('retry request rejected: missing compatible session', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: requesterJid,
+            requesterLogger.debug('retry request rejected: missing compatible session', {
                 remoteRetryCount: request.retryCount,
                 ...getRemoteRetryReasonLogFields(request.retryReason)
             })
@@ -462,10 +526,7 @@ export class WaRetryCoordinator {
             requesterNormalizedDeviceJid
         )
         if (!authorization.authorized) {
-            this.deps.logger.info('retry request rejected', {
-                id: request.stanzaId,
-                originalMsgId: request.originalMsgId,
-                requester: requesterJid,
+            requesterLogger.debug('retry request rejected', {
                 reason: authorization.reason,
                 remoteRetryCount: request.retryCount,
                 ...getRemoteRetryReasonLogFields(request.retryReason)
@@ -560,26 +621,32 @@ export class WaRetryCoordinator {
         }
     }
 
-    private async buildRetryKeysSection(identity: Uint8Array): Promise<WaRetryKeyBundle | null> {
+    private async buildRetryKeysSection(
+        identity: Uint8Array,
+        logContext: { readonly stanzaId?: string; readonly from?: string }
+    ): Promise<WaRetryKeyBundle | null> {
         const [signedPreKey, preKey] = await Promise.all([
             this.deps.signalStore.getSignedPreKey(),
             this.deps.preKeyStore.getOrGenSinglePreKey(generatePreKeyPair)
         ])
         if (!signedPreKey) {
-            this.deps.logger.warn('retry keys section skipped: signed prekey unavailable')
+            this.deps.logger.warn('retry keys section skipped: signed prekey unavailable', {
+                id: logContext.stanzaId,
+                from: logContext.from
+            })
             return null
         }
         await this.deps.preKeyStore.markKeyAsUploaded(preKey.keyId)
         const signedIdentity = this.deps.getCurrentCredentials()?.signedIdentity
         return {
-            identity,
+            identity: toRawPubKey(identity),
             key: {
                 id: preKey.keyId,
-                publicKey: preKey.keyPair.pubKey
+                publicKey: toRawPubKey(preKey.keyPair.pubKey)
             },
             skey: {
                 id: signedPreKey.keyId,
-                publicKey: signedPreKey.keyPair.pubKey,
+                publicKey: toRawPubKey(signedPreKey.keyPair.pubKey),
                 signature: signedPreKey.signature
             },
             deviceIdentity: signedIdentity
@@ -594,6 +661,11 @@ export class WaRetryCoordinator {
         requesterAddress: ReturnType<typeof parseSignalAddressFromJid>,
         requesterNormalizedDeviceJid: string
     ): Promise<boolean> {
+        const requestLogger = this.deps.logger.child({
+            id: request.stanzaId,
+            originalMsgId: request.originalMsgId,
+            requester: requesterJid
+        })
         const [, currentSession] = await Promise.all([
             this.markRetryRequesterSenderKeyAsStale(request, requesterJid, requesterAddress),
             this.deps.sessionStore.getSession(requesterAddress)
@@ -609,12 +681,9 @@ export class WaRetryCoordinator {
             }
             if (request.offline) {
                 if (!currentSession) {
-                    this.deps.logger.info(
+                    requestLogger.debug(
                         'retry request rejected: offline retry missing existing session',
                         {
-                            id: request.stanzaId,
-                            originalMsgId: request.originalMsgId,
-                            requester: requesterJid,
                             remoteRetryCount: request.retryCount,
                             ...getRemoteRetryReasonLogFields(request.retryReason)
                         }
@@ -623,12 +692,9 @@ export class WaRetryCoordinator {
                     return false
                 }
                 if (regIdMismatch) {
-                    this.deps.logger.info(
+                    requestLogger.debug(
                         'retry request rejected: offline retry registration id mismatch',
                         {
-                            id: request.stanzaId,
-                            originalMsgId: request.originalMsgId,
-                            requester: requesterJid,
                             remoteRetryCount: request.retryCount,
                             ...getRemoteRetryReasonLogFields(request.retryReason)
                         }
@@ -639,19 +705,23 @@ export class WaRetryCoordinator {
             } else if (regIdMismatch) {
                 await this.deps.sessionStore.deleteSession(requesterAddress)
             }
-            await this.deps.signalProtocol.establishOutgoingSession(requesterAddress, {
-                regId: request.regId,
-                identity: request.keyBundle.identity,
-                signedKey: {
-                    id: request.keyBundle.skey.id,
-                    publicKey: request.keyBundle.skey.publicKey,
-                    signature: request.keyBundle.skey.signature
+            await this.deps.signalProtocol.establishOutgoingSession(
+                requesterAddress,
+                {
+                    regId: request.regId,
+                    identity: request.keyBundle.identity,
+                    signedKey: {
+                        id: request.keyBundle.skey.id,
+                        publicKey: request.keyBundle.skey.publicKey,
+                        signature: request.keyBundle.skey.signature
+                    },
+                    oneTimeKey: {
+                        id: request.keyBundle.key.id,
+                        publicKey: request.keyBundle.key.publicKey
+                    }
                 },
-                oneTimeKey: {
-                    id: request.keyBundle.key.id,
-                    publicKey: request.keyBundle.key.publicKey
-                }
-            })
+                { reuseExisting: true }
+            )
             return this.applySessionBaseKeyPolicy(
                 request,
                 requesterJid,
@@ -722,7 +792,7 @@ export class WaRetryCoordinator {
         }
 
         await this.deps.sessionStore.deleteSession(requesterAddress)
-        this.deps.logger.info('retry request forcing session refresh due to repeated base key', {
+        this.deps.logger.debug('retry request forcing session refresh due to repeated base key', {
             id: request.stanzaId,
             originalMsgId: request.originalMsgId,
             requester: requesterJid,
@@ -774,6 +844,7 @@ export class WaRetryCoordinator {
         requesterNormalizedDeviceJid: string,
         requesterRegistrationId: number
     ): Promise<SignalPreKeyBundle | null> {
+        const requesterLogger = this.deps.logger.child({ requester: requesterJid })
         try {
             const results = await this.deps.signalMissingPreKeysSync.fetchMissingPreKeys([
                 {
@@ -788,8 +859,7 @@ export class WaRetryCoordinator {
             ])
             const first = results[0]
             if (!first || !('devices' in first)) {
-                this.deps.logger.warn('missing prekeys fetch returned user error', {
-                    requester: requesterJid,
+                requesterLogger.debug('missing prekeys fetch returned user error', {
                     errorText: first && 'errorText' in first ? first.errorText : 'unknown'
                 })
                 return null
@@ -799,16 +869,14 @@ export class WaRetryCoordinator {
                 (device) => normalizeDeviceJid(device.deviceJid) === requesterNormalizedDeviceJid
             )
             if (!matched) {
-                this.deps.logger.warn('missing prekeys fetch did not return requested device', {
-                    requester: requesterJid,
+                requesterLogger.debug('missing prekeys fetch did not return requested device', {
                     devices: first.devices.length
                 })
                 return null
             }
             return matched.bundle
         } catch (error) {
-            this.deps.logger.warn('failed to fetch missing prekeys for retry requester', {
-                requester: requesterJid,
+            requesterLogger.debug('failed to fetch missing prekeys for retry requester', {
                 message: toError(error).message
             })
             return null
@@ -832,7 +900,7 @@ export class WaRetryCoordinator {
         try {
             requesterStatus = await this.deps.retryStore.getOutboundRequesterStatus(
                 outbound.messageId,
-                requesterNormalizedDeviceJid
+                toUserJid(requesterNormalizedDeviceJid)
             )
         } catch (error) {
             this.deps.logger.warn('failed to resolve outbound requester status from retry store', {
@@ -1026,6 +1094,9 @@ export class WaRetryCoordinator {
         if (!this.deps.peerDataOperation || !this.deps.emitIncomingMessage) {
             return false
         }
+        if (this.deps.isMobilePrimary?.()) {
+            return false
+        }
         const subtype = context.messageNode.attrs.subtype
         if (typeof subtype === 'string' && PLACEHOLDER_RESEND_SKIP_SUBTYPES.has(subtype)) {
             return false
@@ -1087,6 +1158,7 @@ export class WaRetryCoordinator {
                         }))
                     }
                 )
+                const meJid = this.deps.getCurrentCredentials()?.meJid
                 for (const result of results) {
                     const bytes = result.placeholderMessageResendResponse?.webMessageInfoBytes
                     if (!bytes) {
@@ -1094,7 +1166,7 @@ export class WaRetryCoordinator {
                     }
                     try {
                         const recovered = proto.WebMessageInfo.decode(bytes)
-                        emitIncomingMessage(buildRecoveredIncomingEvent(recovered))
+                        emitIncomingMessage(buildRecoveredIncomingEvent(recovered, meJid))
                     } catch (error) {
                         this.deps.logger.warn(
                             'placeholder resend: failed to decode WebMessageInfo',

@@ -1174,6 +1174,33 @@ test('message builders merge additionalAttributes with user-wins semantics', () 
     assert.equal(group.attrs.type, 'text')
 })
 
+test('direct fanout stamps peer_recipient_pn when provided and omits it otherwise', () => {
+    const participants = [
+        {
+            jid: '88880000:1@lid',
+            encType: 'msg' as const,
+            ciphertext: new Uint8Array([1])
+        }
+    ]
+    const withPn = buildDirectMessageFanoutNode({
+        to: '88880000@lid',
+        type: 'text',
+        id: 'm1',
+        participants,
+        peerRecipientPn: '5511999999999@s.whatsapp.net'
+    })
+    assert.equal(withPn.attrs.to, '88880000@lid')
+    assert.equal(withPn.attrs.peer_recipient_pn, '5511999999999@s.whatsapp.net')
+
+    const withoutPn = buildDirectMessageFanoutNode({
+        to: '88880000@lid',
+        type: 'text',
+        id: 'm2',
+        participants
+    })
+    assert.equal(withoutPn.attrs.peer_recipient_pn, undefined)
+})
+
 test('pairing builders generate link-code nodes and ack helpers', () => {
     const hello = buildCompanionHelloRequestNode({
         phoneJid: '5511999999999@s.whatsapp.net',
@@ -1313,6 +1340,7 @@ test('retry builder emits registration and key bundle payload', () => {
     assert.ok(Array.isArray(node.content))
     assert.ok(node.content.some((child) => child.tag === WA_NODE_TAGS.REGISTRATION))
     assert.ok(node.content.some((child) => child.tag === 'keys'))
+    assert.equal(node.content[0].attrs.error, '0')
 
     const nodeWithoutKeys = buildRetryReceiptNode({
         stanzaId: 'stanza-2',

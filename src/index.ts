@@ -23,6 +23,10 @@ export type {
     WaGroupEventMembershipRequest,
     WaGroupEventParticipant,
     WaGroupEventSubgroupSuggestion,
+    WaIgnoreKey,
+    WaIgnoreKeyContext,
+    WaIgnoreKeyPredicate,
+    WaIgnoreStanzaKind,
     WaIncomingAddonEvent,
     WaIncomingBaseEvent,
     WaIncomingBotChunkEvent,
@@ -41,6 +45,7 @@ export type {
     WaIncomingProtocolMessageEvent,
     WaIncomingReceiptEvent,
     WaIncomingStanzaFilter,
+    WaIncomingUnavailableMessageEvent,
     WaIncomingUnhandledStanzaEvent,
     WaMexLidChangeEvent,
     WaMexMessageCappingEvent,
@@ -62,6 +67,7 @@ export type {
     WaReceiptStatus,
     WaRegistrationCodeEvent,
     WaSendMessageOptions,
+    WaUnavailableMessageKind,
     WaVerifiedNameResult,
     WaAddonKind,
     WaNewsletterEventAction,
@@ -93,7 +99,8 @@ export type {
     WaBusinessCoordinator,
     WaVerifiedNameBatchEntry
 } from '@client/coordinators/WaBusinessCoordinator'
-export type { WaUploadMediaSource } from '@client/media'
+export { downloadMediaMessage } from '@client/media'
+export type { WaDownloadMediaMessageOptions, WaUploadMediaSource } from '@client/media'
 export type { WaEditBusinessProfileInput } from '@transport/node/builders/business'
 export type {
     WaEmailCoordinator,
@@ -207,6 +214,8 @@ export type {
     WaSendTextMessage
 } from '@message/types'
 export { getContentType, resolveMessageTarget } from '@message/encode/content'
+export { resolveMediaPayload } from '@message/encode/media-payload'
+export type { WaResolvedMediaPayload } from '@message/encode/media-payload'
 export type { WaSendContextInfo } from '@message/context-info'
 export type {
     WaLinkPreviewFetcher,
@@ -229,6 +238,7 @@ export type {
 export { ConsoleLogger } from '@infra/log/ConsoleLogger'
 export { PinoLogger, createPinoLogger } from '@infra/log/PinoLogger'
 export type { PinoLoggerOptions } from '@infra/log/PinoLogger'
+export { createNoopLogger } from '@infra/log/types'
 export type { Logger, LogLevel } from '@infra/log/types'
 export { createStore, WaAuthMemoryStore } from '@store'
 export type {
@@ -275,6 +285,7 @@ export {
     isLidJid,
     isNewsletterJid,
     isStatusBroadcastJid,
+    isUserJid,
     normalizeDeviceJid,
     normalizeRecipientJid,
     parseJidFull,
@@ -291,6 +302,8 @@ export {
     WA_APP_STATE_KEY_TYPES,
     WA_APP_STATE_SYNC_DATA_TYPE,
     WA_BROWSERS,
+    WA_BUSINESS_HOURS_DAYS,
+    WA_BUSINESS_HOURS_MODES,
     WA_COMPANION_PLATFORM_IDS,
     WA_DEFAULTS,
     WA_DIRTY_PROTOCOLS,
@@ -319,6 +332,8 @@ export {
 } from '@protocol'
 export type {
     ParsedJid,
+    WaBusinessHoursDay,
+    WaBusinessHoursMode,
     WaConnectionCode,
     WaConnectionOpenReason,
     WaDisconnectReason,

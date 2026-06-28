@@ -16,6 +16,7 @@ import type { SignalRotateKeyApi } from '@signal/api/SignalRotateKeyApi'
 import { generatePreKeyPair } from '@signal/registration/keygen'
 import type { WaPreKeyStore } from '@store/contracts/pre-key.store'
 import type { WaSignalStore } from '@store/contracts/signal.store'
+import { buildPassiveModeIqNode } from '@transport/node/builders/passive'
 import type { BinaryNode } from '@transport/types'
 import { toError } from '@util/primitives'
 
@@ -46,7 +47,7 @@ export class WaPassiveTasksCoordinator {
     private readonly signedPreKeyRotationIntervalMs: number
     private readonly signedPreKeyServerErrorBackoffMs: number
     private readonly runtime: WaPassiveTasksRuntime
-    private readonly mobilePrimary: boolean
+    private readonly mobilePrimary: () => boolean
     private readonly appStateSync?: WaAppStateSyncClient
     private passiveTasksPromise: Promise<void> | null
 
@@ -59,7 +60,12 @@ export class WaPassiveTasksCoordinator {
         readonly signedPreKeyRotationIntervalMs?: number
         readonly signedPreKeyServerErrorBackoffMs?: number
         readonly runtime: WaPassiveTasksRuntime
-        readonly mobilePrimary?: boolean
+        /**
+         * Resolved when passive tasks run (post-connect, after credentials
+         * load) so a registered mobile-primary session reconnecting without an
+         * explicit `mobileTransport` option still bootstraps the primary path.
+         */
+        readonly mobilePrimary?: () => boolean
         readonly appStateSync?: WaAppStateSyncClient
     }) {
         this.logger = options.logger
@@ -72,7 +78,7 @@ export class WaPassiveTasksCoordinator {
         this.signedPreKeyServerErrorBackoffMs =
             options.signedPreKeyServerErrorBackoffMs ?? SIGNAL_SIGNED_PREKEY_SERVER_ERROR_BACKOFF_MS
         this.runtime = options.runtime
-        this.mobilePrimary = options.mobilePrimary ?? false
+        this.mobilePrimary = options.mobilePrimary ?? (() => false)
         this.appStateSync = options.appStateSync
         this.passiveTasksPromise = null
     }
@@ -122,7 +128,7 @@ export class WaPassiveTasksCoordinator {
 
         this.runtime.syncAbProps()
 
-        if (this.mobilePrimary && this.appStateSync) {
+        if (this.mobilePrimary() && this.appStateSync) {
             await this.appStateSync.ensureInitialSyncKey().catch((error) => {
                 this.logger.warn('app-state initial key generation failed', {
                     message: toError(error).message
@@ -149,6 +155,21 @@ export class WaPassiveTasksCoordinator {
         await this.validateDigestAndRecoverPreKeys(prefetchedLocalKeyBundle)
         await this.rotateSignedPreKeyIfDue(signedPreKeyRotationTs)
         await this.flushDanglingReceipts()
+        await this.sendActiveModeIq()
+    }
+
+    private async sendActiveModeIq(): Promise<void> {
+        try {
+            await this.runtime.queryWithContext(
+                'passive.active',
+                buildPassiveModeIqNode('active'),
+                WA_DEFAULTS.IQ_TIMEOUT_MS
+            )
+        } catch (error) {
+            this.logger.warn('passive active iq failed', {
+                message: toError(error).message
+            })
+        }
     }
 
     private async validateDigestAndRecoverPreKeys(
@@ -222,7 +243,7 @@ export class WaPassiveTasksCoordinator {
                 count: preKeys.length,
                 lastPreKeyId
             },
-            this.mobilePrimary ? { useSystemId: true } : undefined
+            this.mobilePrimary() ? { useSystemId: true } : undefined
         )
         if (response.attrs.type === WA_IQ_TYPES.RESULT) {
             // Mark uploaded key first so the serverHasPreKeys flag never commits ahead of local key progress.
@@ -241,6 +262,7 @@ export class WaPassiveTasksCoordinator {
         const failure = parsePreKeyUploadFailure(response)
         this.logger.warn('upload prekeys failed', {
             count: preKeys.length,
+            lastPreKeyId,
             errorCode: failure.errorCode,
             errorText: failure.errorText
         })

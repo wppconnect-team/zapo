@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { APP_STATE_EMPTY_LT_HASH } from '@appstate/constants'
+import { WaAppStateCrypto } from '@appstate/crypto/WaAppStateCrypto'
 import { WaAppStateSyncClient } from '@appstate/sync/WaAppStateSyncClient'
-import { createNoopLogger } from '@infra/log/types'
+import { keyEpoch } from '@appstate/utils'
+import { createNoopLogger, type Logger } from '@infra/log/types'
 import { type Proto, proto } from '@proto'
 import {
     WA_APP_STATE_COLLECTION_STATES,
@@ -351,7 +353,10 @@ test('ensureInitialSyncKey mints a 32-byte key with fingerprint when store is em
 
     assert.equal(await store.getActiveSyncKey(), null)
     const first = await client.ensureInitialSyncKey()
-    assert.equal(first.keyId.length, 2)
+    assert.equal(first.keyId.length, 6)
+    assert.equal(first.keyId[0], 0)
+    assert.equal(first.keyId[1], 0)
+    assert.ok(keyEpoch(first.keyId) >= 1)
     assert.equal(first.keyData.length, 32)
     assert.ok(first.fingerprint)
     assert.equal(first.fingerprint?.currentIndex, 0)
@@ -361,4 +366,267 @@ test('ensureInitialSyncKey mints a 32-byte key with fingerprint when store is em
     const second = await client.ensureInitialSyncKey()
     assert.deepEqual(second.keyId, first.keyId)
     assert.deepEqual(second.keyData, first.keyData)
+})
+
+test('appstate sync applies catch-up patches on 409 conflict and re-uploads the pending mutation', async () => {
+    const store = new WaAppStateMemoryStore()
+    const key = {
+        keyId: new Uint8Array([0, 0, 0, 0, 0, 8]),
+        keyData: new Uint8Array(32).fill(9),
+        timestamp: 4
+    }
+    await store.upsertSyncKeys([key])
+
+    const conflictPatches = [
+        {
+            tag: WA_NODE_TAGS.PATCH,
+            attrs: {},
+            content: proto.SyncdPatch.encode({ version: { version: 1 } }).finish()
+        },
+        {
+            tag: WA_NODE_TAGS.PATCH,
+            attrs: {},
+            content: proto.SyncdPatch.encode({ version: { version: 2 } }).finish()
+        }
+    ]
+
+    let call = 0
+    const patchByCall: boolean[] = []
+    const query = async (node: BinaryNode): Promise<BinaryNode> => {
+        call += 1
+        const syncNode = (node.content as readonly BinaryNode[])[0]
+        const collectionNode = (syncNode.content as readonly BinaryNode[])[0]
+        const content = collectionNode.content as readonly BinaryNode[] | undefined
+        patchByCall.push(content?.some((child) => child.tag === WA_NODE_TAGS.PATCH) ?? false)
+        const collection: BinaryNode =
+            call === 1
+                ? {
+                      tag: WA_NODE_TAGS.COLLECTION,
+                      attrs: { type: 'error', name: WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK },
+                      content: [
+                          {
+                              tag: WA_NODE_TAGS.ERROR,
+                              attrs: { code: '409', text: 'conflict' }
+                          },
+                          { tag: WA_NODE_TAGS.PATCHES, attrs: {}, content: conflictPatches }
+                      ]
+                  }
+                : {
+                      tag: WA_NODE_TAGS.COLLECTION,
+                      attrs: { name: WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK, version: '3' }
+                  }
+        return {
+            tag: WA_NODE_TAGS.IQ,
+            attrs: { type: WA_IQ_TYPES.RESULT },
+            content: [{ tag: WA_NODE_TAGS.SYNC, attrs: {}, content: [collection] }]
+        }
+    }
+
+    const client = new WaAppStateSyncClient({
+        serverClock: { nowMs: () => Date.now(), nowSeconds: () => Math.floor(Date.now() / 1000) },
+        logger: createNoopLogger(),
+        query,
+        store,
+        mobilePrimary: () => true,
+        skipMacVerification: true
+    })
+
+    const result = await client.sync({
+        collections: [WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK],
+        pendingMutations: [
+            {
+                collection: WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK,
+                operation: 'set',
+                index: JSON.stringify(['setting_pushName']),
+                value: { timestamp: 4_000, pushNameSetting: { name: 'Maria' } },
+                version: 1,
+                timestamp: 4_000
+            }
+        ]
+    })
+
+    assert.equal(call, 2)
+    assert.deepEqual(patchByCall, [true, true])
+    assert.equal(result.collections[0].state, WA_APP_STATE_COLLECTION_STATES.SUCCESS)
+    const persisted = await store.getCollectionState(WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK)
+    assert.equal(persisted.version, 3)
+})
+
+test('mobile primary uploads patch from fresh state without requesting a snapshot', async () => {
+    const store = new WaAppStateMemoryStore()
+    const key = {
+        keyId: new Uint8Array([0, 0, 0, 0, 0, 7]),
+        keyData: new Uint8Array(32).fill(9),
+        timestamp: 4
+    }
+    await store.upsertSyncKeys([key])
+
+    const returnSnapshotByCall: string[] = []
+    const patchByCall: boolean[] = []
+    const query = async (node: BinaryNode): Promise<BinaryNode> => {
+        const syncNode = (node.content as readonly BinaryNode[])[0]
+        const collectionNode = (syncNode.content as readonly BinaryNode[])[0]
+        const content = collectionNode.content as readonly BinaryNode[] | undefined
+        returnSnapshotByCall.push(collectionNode.attrs.return_snapshot)
+        patchByCall.push(content?.some((child) => child.tag === WA_NODE_TAGS.PATCH) ?? false)
+        return {
+            tag: WA_NODE_TAGS.IQ,
+            attrs: { type: WA_IQ_TYPES.RESULT },
+            content: [
+                {
+                    tag: WA_NODE_TAGS.SYNC,
+                    attrs: {},
+                    content: [
+                        {
+                            tag: WA_NODE_TAGS.COLLECTION,
+                            attrs: { name: WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK, version: '1' }
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    const client = new WaAppStateSyncClient({
+        serverClock: { nowMs: () => Date.now(), nowSeconds: () => Math.floor(Date.now() / 1000) },
+        logger: createNoopLogger(),
+        query,
+        store,
+        mobilePrimary: () => true,
+        skipMacVerification: true
+    })
+
+    const result = await client.sync({
+        collections: [WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK],
+        pendingMutations: [
+            {
+                collection: WA_APP_STATE_COLLECTIONS.CRITICAL_BLOCK,
+                operation: 'set',
+                index: JSON.stringify(['setting_pushName']),
+                value: { timestamp: 4_000, pushNameSetting: { name: 'Maria' } },
+                version: 1,
+                timestamp: 4_000
+            }
+        ]
+    })
+
+    assert.deepEqual(returnSnapshotByCall, ['false'])
+    assert.deepEqual(patchByCall, [true])
+    assert.equal(result.collections[0].state, WA_APP_STATE_COLLECTION_STATES.SUCCESS)
+})
+
+test('appstate sync tolerates a poisoned snapshot MAC and persists partial state', async () => {
+    const store = new WaAppStateMemoryStore()
+    const key = {
+        keyId: new Uint8Array([0, 0, 0, 0, 0, 9]),
+        keyData: new Uint8Array(32).fill(11),
+        timestamp: 9
+    }
+    await store.upsertSyncKeys([key])
+
+    // Build a real, fully decryptable snapshot, then corrupt only its aggregate
+    // MAC - exactly the server-side LT-hash inconsistency observed in production.
+    const snapshotCrypto = new WaAppStateCrypto()
+    const record = await snapshotCrypto.encryptMutation({
+        operation: proto.SyncdMutation.SyncdOperation.SET,
+        keyId: key.keyId,
+        keyData: key.keyData,
+        index: JSON.stringify(['mute', '120363078720039631@g.us']),
+        value: { timestamp: 1_000, muteAction: { muted: true } },
+        version: 1
+    })
+    const version = 7
+    const ltHash = await snapshotCrypto.ltHashAdd(APP_STATE_EMPTY_LT_HASH, [record.valueMac])
+    const validMac = await snapshotCrypto.generateSnapshotMac(
+        key.keyData,
+        ltHash,
+        version,
+        WA_APP_STATE_COLLECTIONS.REGULAR_HIGH
+    )
+    const poisonedMac = Uint8Array.from(validMac)
+    poisonedMac[0] ^= 0xff
+
+    const snapshotBytes = proto.SyncdSnapshot.encode({
+        version: { version },
+        records: [
+            {
+                index: { blob: record.indexMac },
+                value: { blob: record.valueBlob },
+                keyId: { id: key.keyId }
+            }
+        ],
+        keyId: { id: key.keyId },
+        mac: poisonedMac
+    }).finish()
+
+    const snapshotRef = proto.ExternalBlobReference.encode({
+        directPath: '/snapshot/blob',
+        mediaKey: new Uint8Array(32).fill(1),
+        fileSha256: new Uint8Array(32).fill(2),
+        fileEncSha256: new Uint8Array(32).fill(3)
+    }).finish()
+
+    const query = async (): Promise<BinaryNode> => ({
+        tag: WA_NODE_TAGS.IQ,
+        attrs: { type: WA_IQ_TYPES.RESULT },
+        content: [
+            {
+                tag: WA_NODE_TAGS.SYNC,
+                attrs: {},
+                content: [
+                    {
+                        tag: WA_NODE_TAGS.COLLECTION,
+                        attrs: {
+                            name: WA_APP_STATE_COLLECTIONS.REGULAR_HIGH,
+                            version: String(version)
+                        },
+                        content: [{ tag: WA_NODE_TAGS.SNAPSHOT, attrs: {}, content: snapshotRef }]
+                    }
+                ]
+            }
+        ]
+    })
+
+    let warnCount = 0
+    const makeLogger = (): Logger => ({
+        level: 'trace',
+        trace: () => undefined,
+        debug: () => undefined,
+        info: () => undefined,
+        warn: () => {
+            warnCount += 1
+        },
+        error: () => undefined,
+        child: () => makeLogger()
+    })
+
+    const client = new WaAppStateSyncClient({
+        serverClock: { nowMs: () => Date.now(), nowSeconds: () => Math.floor(Date.now() / 1000) },
+        logger: makeLogger(),
+        query,
+        store
+    })
+
+    let downloadCalls = 0
+    const result = await client.sync({
+        collections: [WA_APP_STATE_COLLECTIONS.REGULAR_HIGH],
+        downloadExternalBlob: async (_collection, kind) => {
+            downloadCalls += 1
+            assert.equal(kind, 'snapshot')
+            return snapshotBytes
+        }
+    })
+
+    // Does not throw, does not loop into ERROR_RETRY: one download, success state.
+    assert.equal(downloadCalls, 1)
+    assert.equal(result.collections.length, 1)
+    assert.equal(result.collections[0].state, WA_APP_STATE_COLLECTION_STATES.SUCCESS)
+    assert.ok(warnCount >= 1)
+
+    // Partial state is persisted so the collection leaves version 0 and later
+    // patches apply incrementally instead of re-requesting the same snapshot.
+    const persisted = await store.getCollectionState(WA_APP_STATE_COLLECTIONS.REGULAR_HIGH)
+    assert.equal(persisted.version, version)
+    assert.equal(persisted.initialized, true)
+    assert.equal(persisted.indexValueMap.size, 1)
 })

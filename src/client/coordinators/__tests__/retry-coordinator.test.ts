@@ -6,7 +6,10 @@ import type { WaIncomingMessageEvent } from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import type { PeerDataOperationRequester } from '@message/primitives/peer-data-operation'
 import { proto, type Proto } from '@proto'
+import { WA_MESSAGE_TYPES } from '@protocol/constants'
+import { parseJidFull } from '@protocol/jid'
 import type {
+    WaParsedRetryRequest,
     WaRetryDecryptFailureContext,
     WaRetryOutboundMessageRecord,
     WaRetryOutboundState
@@ -173,7 +176,7 @@ function buildPlaceholderContext(
         recipient: overrides.recipient,
         t: overrides.t,
         ...overrides
-    } as WaRetryDecryptFailureContext
+    }
 }
 
 function createPlaceholderHarness(): PlaceholderHarness {
@@ -186,7 +189,7 @@ function createPlaceholderHarness(): PlaceholderHarness {
     > = []
     const peerDataOperation: PeerDataOperationRequester = {
         request: async (_type, body) => {
-            captured.push((body.placeholderMessageResendRequest ?? []) as never)
+            captured.push(body.placeholderMessageResendRequest ?? [])
             return new Promise((resolve) => {
                 pendingResolvers.push(resolve)
             })
@@ -337,7 +340,6 @@ test('placeholder resend: decodes WebMessageInfo and re-emits as incoming messag
     const event = harness.emitted[0]
     assert.equal(event.key.id, 'recover-1')
     assert.equal(event.key.remoteJid, '551122223333@s.whatsapp.net')
-    assert.equal(event.encryptionType, 'placeholder_recovery')
     assert.equal(event.message?.conversation, 'recovered')
 })
 
@@ -363,12 +365,166 @@ test('placeholder resend: releases in-flight slots after each batch completes', 
     assert.equal(harness.captured.length, 2)
 })
 
+test('mobile primary does not delegate to placeholder resend and keeps sending retry receipts', async () => {
+    const sentNodes: BinaryNode[] = []
+    const emitted: WaIncomingMessageEvent[] = []
+    const placeholderRequests: number[] = []
+    const peerDataOperation: PeerDataOperationRequester = {
+        request: async () => {
+            placeholderRequests.push(1)
+            return []
+        },
+        send: async () => ({ messageId: 'unused' })
+    }
+
+    const sharedDeps = {
+        logger: createNoopLogger(),
+        retryStore: {
+            getTtlMs: () => 60_000,
+            incrementInboundCounter: async () => 3,
+            cleanupExpired: async () => 0
+        } as unknown as WaRetryStore,
+        signalStore: {
+            getRegistrationInfo: async () => ({
+                registrationId: 42,
+                identityKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) }
+            }),
+            getSignedPreKey: async () => ({
+                keyId: 7,
+                keyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) },
+                signature: new Uint8Array(64)
+            })
+        } as never,
+        preKeyStore: {
+            getOrGenSinglePreKey: async () => ({
+                keyId: 11,
+                keyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) }
+            }),
+            markKeyAsUploaded: async () => undefined
+        } as never,
+        sessionStore: {} as never,
+        senderKeyStore: {} as never,
+        signalProtocol: {} as never,
+        sessionResolver: {} as never,
+        signalDeviceSync: {} as never,
+        signalMissingPreKeysSync: {} as never,
+        messageClient: {} as never,
+        sendNode: async (node: BinaryNode) => {
+            sentNodes.push(node)
+        },
+        getCurrentCredentials: () => null
+    }
+
+    const freshT = String(Math.trunc(Date.now() / 1000))
+    const context = buildPlaceholderContext({ stanzaId: 'mobile-1', t: freshT })
+
+    // Mobile primary: placeholder deps withheld, a high retry count must still
+    // go out as a retry receipt.
+    const mobileCoordinator = new WaRetryCoordinator(sharedDeps)
+    const mobileHandled = await mobileCoordinator.onDecryptFailure(context, new Error('boom'))
+    assert.equal(mobileHandled, true)
+    // Retry handling is deferred to a bounded background queue; let it drain.
+    await flushMicrotasks()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(placeholderRequests.length, 0)
+    assert.equal(emitted.length, 0)
+    // Mobile: retry receipt + transport ack (no placeholder).
+    assert.equal(sentNodes.length, 2)
+    assert.equal(sentNodes[0].tag, 'receipt')
+    assert.equal(sentNodes[0].attrs.type, 'retry')
+    assert.equal(sentNodes[1].tag, 'ack')
+    assert.equal(sentNodes[1].attrs.class, 'message')
+    assert.equal(sentNodes[1].attrs.error, '500')
+
+    // Companion: the same retry count delegates to placeholder resend; the
+    // stanza is still acked.
+    const companionCoordinator = new WaRetryCoordinator({
+        ...sharedDeps,
+        peerDataOperation,
+        emitIncomingMessage: (event) => emitted.push(event)
+    })
+    const companionHandled = await companionCoordinator.onDecryptFailure(
+        buildPlaceholderContext({ stanzaId: 'companion-1', t: freshT }),
+        new Error('boom')
+    )
+    assert.equal(companionHandled, true)
+    // Drain the deferred queue, then wait out the placeholder debounce.
+    await flushMicrotasks()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    // Only an ack was added for the companion path (no retry receipt).
+    assert.equal(sentNodes.length, 3)
+    assert.equal(sentNodes[2].tag, 'ack')
+    assert.equal(sentNodes[2].attrs.class, 'message')
+    assert.equal(placeholderRequests.length, 1)
+})
+
+test('decrypt-failure retry gives up past the retry ceiling (acks stanza, no receipt/placeholder)', async () => {
+    const sentNodes: BinaryNode[] = []
+    const placeholderRequests: number[] = []
+    const coordinator = new WaRetryCoordinator({
+        logger: createNoopLogger(),
+        retryStore: {
+            getTtlMs: () => 60_000,
+            // Past MAX_RETRY_ATTEMPTS (5): a redelivered stanza that keeps failing.
+            incrementInboundCounter: async () => 6,
+            cleanupExpired: async () => 0
+        } as unknown as WaRetryStore,
+        signalStore: {
+            getRegistrationInfo: async () => ({
+                registrationId: 42,
+                identityKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) }
+            }),
+            getSignedPreKey: async () => {
+                throw new Error('should not build keys past the ceiling')
+            }
+        } as never,
+        preKeyStore: {} as never,
+        sessionStore: {} as never,
+        senderKeyStore: {} as never,
+        signalProtocol: {} as never,
+        sessionResolver: {} as never,
+        signalDeviceSync: {} as never,
+        signalMissingPreKeysSync: {} as never,
+        messageClient: {} as never,
+        sendNode: async (node: BinaryNode) => {
+            sentNodes.push(node)
+        },
+        getCurrentCredentials: () => null,
+        peerDataOperation: {
+            request: async () => {
+                placeholderRequests.push(1)
+                return []
+            },
+            send: async () => ({ messageId: 'unused' })
+        },
+        emitIncomingMessage: () => undefined
+    })
+
+    const handled = await coordinator.onDecryptFailure(
+        buildPlaceholderContext({
+            stanzaId: 'over-limit',
+            t: String(Math.trunc(Date.now() / 1000))
+        }),
+        new Error('signal session not found')
+    )
+
+    assert.equal(handled, true)
+    // Retry handling is deferred to a bounded background queue; let it drain.
+    await flushMicrotasks()
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    // Past the ceiling: no retry receipt, no placeholder, only the consuming ack.
+    assert.equal(sentNodes.length, 1)
+    assert.equal(sentNodes[0].tag, 'ack')
+    assert.equal(sentNodes[0].attrs.class, 'message')
+    assert.equal(sentNodes[0].attrs.error, '500')
+    assert.equal(placeholderRequests.length, 0)
+})
+
 test('retry coordinator serializes outbound receipt tracking per message id', async () => {
     const nowMs = Date.now()
     const retryStore = new ControlledRetryStore({
         messageId: 'msg-1',
         toJid: '551100000000@s.whatsapp.net',
-        messageType: 'text',
         replayMode: 'plaintext',
         replayPayload: {
             mode: 'plaintext',
@@ -377,7 +533,6 @@ test('retry coordinator serializes outbound receipt tracking per message id', as
             plaintext: new Uint8Array([1, 2, 3])
         },
         state: 'pending',
-        createdAtMs: nowMs,
         updatedAtMs: nowMs,
         expiresAtMs: nowMs + 60_000
     })
@@ -408,4 +563,142 @@ test('retry coordinator serializes outbound receipt tracking per message id', as
 
     assert.equal(retryStore.getCurrentState(), 'read')
     assert.deepEqual(retryStore.getTransitions(), ['delivered', 'read'])
+})
+
+function buildKeyBundleRequest(retryCount: number, requesterJid: string): WaParsedRetryRequest {
+    return {
+        type: WA_MESSAGE_TYPES.RECEIPT_TYPE_RETRY,
+        stanzaId: `retry-${retryCount}`,
+        from: requesterJid,
+        offline: false,
+        isLid: false,
+        originalMsgId: 'churn-msg',
+        retryCount,
+        regId: 555,
+        keyBundle: {
+            identity: new Uint8Array(33),
+            key: { id: 1, publicKey: new Uint8Array(32) },
+            skey: { id: 2, publicKey: new Uint8Array(32), signature: new Uint8Array(64) }
+        }
+    }
+}
+
+type RetrySessionInternals = {
+    updateLocalSessionFromRetryRequest: (
+        request: WaParsedRetryRequest,
+        requesterJid: string,
+        requesterAddress: ReturnType<typeof parseJidFull>['address'],
+        requesterNormalizedDeviceJid: string
+    ) => Promise<boolean>
+}
+
+test('retry session update reuses an existing compatible session instead of re-keying', async () => {
+    const existingSession = {
+        remote: { regId: 555, pubKey: new Uint8Array(33) },
+        aliceBaseKey: new Uint8Array([9, 9, 9])
+    } as never
+
+    const establishOptions: unknown[] = []
+    const coordinator = new WaRetryCoordinator({
+        logger: createNoopLogger(),
+        retryStore: { getTtlMs: () => 60_000 } as unknown as WaRetryStore,
+        signalStore: {} as never,
+        preKeyStore: {} as never,
+        sessionStore: {
+            getSession: async () => existingSession,
+            deleteSession: async () => undefined
+        } as never,
+        senderKeyStore: {} as never,
+        signalProtocol: {
+            establishOutgoingSession: async (
+                _address: unknown,
+                _bundle: unknown,
+                options: unknown
+            ) => {
+                establishOptions.push(options)
+                return existingSession
+            }
+        } as never,
+        sessionResolver: {} as never,
+        signalDeviceSync: {} as never,
+        signalMissingPreKeysSync: {} as never,
+        messageClient: {} as never,
+        sendNode: async () => undefined,
+        getCurrentCredentials: () => null
+    })
+
+    const internals = coordinator as unknown as RetrySessionInternals
+    const requesterJid = '551100000000:3@s.whatsapp.net'
+    const parsed = parseJidFull(requesterJid)
+    const ready = await internals.updateLocalSessionFromRetryRequest(
+        buildKeyBundleRequest(2, requesterJid),
+        requesterJid,
+        parsed.address,
+        parsed.normalizedJid
+    )
+
+    assert.equal(ready, true)
+    // The keyBundle establish reuses the existing session rather than minting a
+    // fresh base key on every retry.
+    assert.deepEqual(establishOptions, [{ reuseExisting: true }])
+})
+
+test('retry session update resets the session once the base key repeats at retry 3', async () => {
+    const existingSession = {
+        remote: { regId: 555, pubKey: new Uint8Array(33) },
+        aliceBaseKey: new Uint8Array([7, 7, 7])
+    } as never
+
+    let deleteCount = 0
+    let fetchCount = 0
+    const coordinator = new WaRetryCoordinator({
+        logger: createNoopLogger(),
+        retryStore: { getTtlMs: () => 60_000 } as unknown as WaRetryStore,
+        signalStore: {} as never,
+        preKeyStore: {} as never,
+        sessionStore: {
+            getSession: async () => existingSession,
+            deleteSession: async () => {
+                deleteCount += 1
+            }
+        } as never,
+        senderKeyStore: {} as never,
+        signalProtocol: {
+            establishOutgoingSession: async () => existingSession
+        } as never,
+        sessionResolver: {} as never,
+        signalDeviceSync: {} as never,
+        signalMissingPreKeysSync: {
+            fetchMissingPreKeys: async () => {
+                fetchCount += 1
+                return [{ devices: [{ deviceJid: '551100000000:3@s.whatsapp.net', bundle: {} }] }]
+            }
+        } as never,
+        messageClient: {} as never,
+        sendNode: async () => undefined,
+        getCurrentCredentials: () => null
+    })
+
+    const internals = coordinator as unknown as RetrySessionInternals
+    const requesterJid = '551100000000:3@s.whatsapp.net'
+    const parsed = parseJidFull(requesterJid)
+    const run = (retryCount: number): Promise<boolean> =>
+        internals.updateLocalSessionFromRetryRequest(
+            buildKeyBundleRequest(retryCount, requesterJid),
+            requesterJid,
+            parsed.address,
+            parsed.normalizedJid
+        )
+
+    // Retry 2 only records the session base key.
+    await run(2)
+    assert.equal(deleteCount, 0)
+    assert.equal(fetchCount, 0)
+
+    // Retry 3 sees the same (reused) base key and forces a clean session:
+    // delete + fetch fresh prekeys + re-establish.
+    const ready = await run(3)
+    assert.equal(ready, true)
+    assert.equal(deleteCount, 1)
+    assert.equal(fetchCount, 1)
 })

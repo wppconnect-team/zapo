@@ -1,9 +1,14 @@
 {
     "name": "@zapo-js/fake-server",
-    "version": "0.3.0",
+    "version": "1.0.0",
     "description": "Fake WhatsApp Web server used to test zapo-js",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vinikjkkj/zapo.git",
+        "directory": "packages/fake-server"
+    },
     "main": "dist/index.js",
     "module": "dist/esm/index.js",
     "types": "dist/index.d.ts",
@@ -35,13 +40,15 @@
         "bench:usync": "node --expose-gc --import tsx bench/bulk-usync.bench.ts",
         "bench:group": "node --expose-gc --import tsx bench/group-provision.bench.ts",
         "bench:media": "node --expose-gc --import tsx bench/media-upload.bench.ts",
+        "bench:media:messaging": "node --expose-gc --import tsx bench/messaging-media.bench.ts",
+        "bench:retry": "node --expose-gc --import tsx bench/retry.bench.ts",
         "bench:receipts": "node --expose-gc --import tsx bench/receipts-flood.bench.ts",
         "bench:reconnect": "node --expose-gc --import tsx bench/reconnect-resume.bench.ts",
         "bench:appstate": "node --expose-gc --import tsx bench/appstate.bench.ts",
         "bench:all-stores": "node bench/run-all-stores.cjs"
     },
     "peerDependencies": {
-        "zapo-js": ">=0.1.0"
+        "zapo-js": "^1.0.0"
     },
     "dependencies": {
         "ws": "^8.18.0"

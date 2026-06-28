@@ -24,18 +24,16 @@ function buildOutboundRecord(
     return {
         messageId,
         toJid: 'target@s.whatsapp.net',
-        messageType: 'text',
         replayMode: replayPayload.mode,
         replayPayload: encodeRetryReplayPayload(replayPayload),
         state: 'pending',
-        createdAtMs: now,
         updatedAtMs: now,
         expiresAtMs: now + 60_000
     }
 }
 
 function createLogger(warnings: string[] = []): Logger {
-    return {
+    const logger: Logger = {
         level: 'trace',
         trace: () => undefined,
         debug: () => undefined,
@@ -43,8 +41,10 @@ function createLogger(warnings: string[] = []): Logger {
         warn: (message) => {
             warnings.push(message)
         },
-        error: () => undefined
+        error: () => undefined,
+        child: () => logger
     }
+    return logger
 }
 
 const NOOP_SESSION_RESOLVER: SignalSessionResolver = {
@@ -110,6 +110,18 @@ test('retry state ranking and reason mapping favor higher-priority states', () =
     assert.equal(
         mapRetryReasonFromError(new Error('invalid signature data')),
         RETRY_REASON.SignalErrorInvalidSignature
+    )
+    assert.equal(
+        mapRetryReasonFromError(new Error('message too far in future')),
+        RETRY_REASON.SignalErrorFutureMessage
+    )
+    assert.equal(
+        mapRetryReasonFromError(new Error('sender key message is too far in future')),
+        RETRY_REASON.SignalErrorFutureMessage
+    )
+    assert.equal(
+        mapRetryReasonFromError(new Error('invalid message mac')),
+        RETRY_REASON.SignalErrorBadMac
     )
     assert.equal(mapRetryReasonFromError(new Error('totally unknown error')), undefined)
 })
@@ -251,7 +263,6 @@ test('retry replay service accepts raw replay payloads from memory store', async
     const outbound: WaRetryOutboundMessageRecord = {
         messageId: 'm-plain-raw',
         toJid: '5511999999999@s.whatsapp.net',
-        messageType: 'text',
         replayMode: 'plaintext',
         replayPayload: {
             mode: 'plaintext',
@@ -260,7 +271,6 @@ test('retry replay service accepts raw replay payloads from memory store', async
             plaintext: new Uint8Array([1, 2, 3])
         },
         state: 'pending',
-        createdAtMs: now,
         updatedAtMs: now,
         expiresAtMs: now + 60_000
     }
@@ -384,7 +394,6 @@ test('retry replay service emits status@broadcast retry with meta and no address
     const outbound: WaRetryOutboundMessageRecord = {
         messageId: 'm-status-1',
         toJid: 'status@broadcast',
-        messageType: 'text',
         replayMode: 'plaintext',
         replayPayload: {
             mode: 'plaintext',
@@ -394,7 +403,6 @@ test('retry replay service emits status@broadcast retry with meta and no address
             statusSetting: 'denylist'
         },
         state: 'pending',
-        createdAtMs: now,
         updatedAtMs: now,
         expiresAtMs: now + 60_000
     }

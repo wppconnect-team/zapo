@@ -9,9 +9,16 @@ import type { WaGroupEvent, WaGroupEventAction } from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import { proto } from '@proto'
 import { WaGroupMetadataMemoryStore } from '@store/memory/group-metadata.store'
+import type { ServerClock } from '@util/clock'
+
+const localServerClock: ServerClock = {
+    nowMs: () => Date.now(),
+    nowSeconds: () => Math.floor(Date.now() / 1000)
+}
 
 const BUILD_OPTIONS = {
-    logger: createNoopLogger()
+    logger: createNoopLogger(),
+    serverClock: localServerClock
 } as unknown as WaMediaMessageOptions
 
 function createGroupEvent(input: {
@@ -171,6 +178,76 @@ test('group metadata cache mutates membership from events', async () => {
     }
 })
 
+test('group metadata cache add stores only the canonical (lid) participant form', async () => {
+    const groupMetadataStore = new WaGroupMetadataMemoryStore(60_000)
+    try {
+        const cache = createGroupMetadataCache({
+            groupMetadataStore,
+            queryGroupMetadata: async () => ({ participants: [] }),
+            logger: createNoopLogger()
+        })
+
+        await cache.mutateFromGroupEvent(
+            createGroupEvent({
+                action: 'create',
+                groupJid: '120@g.us',
+                participants: ['108869518913624@lid']
+            })
+        )
+
+        await cache.mutateFromGroupEvent({
+            rawNode: { tag: 'notification', attrs: {} },
+            rawActionNode: { tag: 'add', attrs: {} },
+            action: 'add',
+            groupJid: '120@g.us',
+            participants: [
+                {
+                    jid: '75935072161893@lid',
+                    phoneJid: '554796129545@s.whatsapp.net'
+                }
+            ]
+        })
+
+        const cached = await groupMetadataStore.getGroupMetadata('120@g.us')
+        assert.deepEqual(cached?.participants, ['108869518913624@lid', '75935072161893@lid'])
+    } finally {
+        await groupMetadataStore.destroy()
+    }
+})
+
+test('group metadata cache resolve awaits an in-flight membership mutation', async () => {
+    const groupMetadataStore = new WaGroupMetadataMemoryStore(60_000)
+    try {
+        const cache = createGroupMetadataCache({
+            groupMetadataStore,
+            queryGroupMetadata: async () => ({ participants: [] }),
+            logger: createNoopLogger()
+        })
+
+        await cache.mutateFromGroupEvent(
+            createGroupEvent({
+                action: 'create',
+                groupJid: '120@g.us',
+                participants: ['551100000000@s.whatsapp.net']
+            })
+        )
+
+        const joinMutation = cache.mutateFromGroupEvent(
+            createGroupEvent({
+                action: 'add',
+                groupJid: '120@g.us',
+                participants: ['552200000000@s.whatsapp.net']
+            })
+        )
+        const resolved = await cache.resolveParticipantUsers('120@g.us')
+        await joinMutation
+
+        assert.deepEqual(resolved, ['551100000000@s.whatsapp.net', '552200000000@s.whatsapp.net'])
+    } finally {
+        await groupMetadataStore.destroy()
+    }
+})
+
 test('group metadata cache stores and updates ephemeral from events', async () => {
     const groupMetadataStore = new WaGroupMetadataMemoryStore(60_000)
     try {
@@ -193,7 +270,7 @@ test('group metadata cache stores and updates ephemeral from events', async () =
             action: 'ephemeral',
             groupJid: '120@g.us',
             expirationSeconds: 7_776_000
-        } as WaGroupEvent)
+        })
 
         assert.equal(await cache.getEphemeral('120@g.us'), 7_776_000)
 
@@ -203,7 +280,7 @@ test('group metadata cache stores and updates ephemeral from events', async () =
             action: 'ephemeral',
             groupJid: '120@g.us',
             expirationSeconds: 0
-        } as WaGroupEvent)
+        })
 
         assert.equal(await cache.getEphemeral('120@g.us'), 0)
     } finally {
@@ -226,7 +303,7 @@ test('group metadata cache ignores ephemeral events for uncached groups', async 
             action: 'ephemeral',
             groupJid: '120@g.us',
             expirationSeconds: 86_400
-        } as WaGroupEvent)
+        })
 
         assert.equal(await cache.getEphemeral('120@g.us'), null)
         assert.equal(await groupMetadataStore.getGroupMetadata('120@g.us'), null)
@@ -285,7 +362,7 @@ test('group metadata cache create event preserves cached ephemeral', async () =>
             action: 'create',
             groupJid: '120@g.us',
             participants: [{ jid: '552200000000@s.whatsapp.net' }]
-        } as WaGroupEvent)
+        })
 
         const after = await groupMetadataStore.getGroupMetadata('120@g.us')
         assert.equal(after?.ephemeral, 86_400)
@@ -631,4 +708,43 @@ test('buildMediaMessageContent encrypts event-response with addon-crypto and cho
     assert.ok(resp?.encPayload instanceof Uint8Array)
     assert.ok(resp?.encIv instanceof Uint8Array)
     assert.equal(resp?.encIv?.byteLength, 12)
+})
+
+test('buildMediaMessageContent applies server-clock skew when caller omits timestamps', async () => {
+    const fixedMs = 1_700_000_000_000
+    const fixedSeconds = Math.floor(fixedMs / 1000)
+    const skewedClock = {
+        logger: createNoopLogger(),
+        serverClock: {
+            nowMs: () => fixedMs,
+            nowSeconds: () => fixedSeconds
+        }
+    } as unknown as WaMediaMessageOptions
+
+    const chatJid = '551122222222@s.whatsapp.net'
+
+    const reaction = await buildMediaMessageContent(
+        skewedClock,
+        {
+            type: 'reaction',
+            emoji: '🔥',
+            target: { remoteJid: chatJid, id: 'STANZA_R', fromMe: true }
+        },
+        { to: chatJid }
+    )
+    assert.equal(reaction.message.reactionMessage?.senderTimestampMs, fixedMs)
+
+    const pin = await buildMediaMessageContent(
+        skewedClock,
+        { type: 'pin', target: { remoteJid: chatJid, id: 'STANZA_P', fromMe: true } },
+        { to: chatJid }
+    )
+    assert.equal(pin.message.pinInChatMessage?.senderTimestampMs, fixedMs)
+
+    const keep = await buildMediaMessageContent(
+        skewedClock,
+        { type: 'keep', target: { remoteJid: chatJid, id: 'STANZA_K', fromMe: true } },
+        { to: chatJid }
+    )
+    assert.equal(keep.message.keepInChatMessage?.timestampMs, fixedMs)
 })

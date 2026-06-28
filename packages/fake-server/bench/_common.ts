@@ -68,7 +68,7 @@ export function forceGcIfAvailable(): void {
     if (gc) gc()
 }
 
-export const NOOP_LOGGER: Logger = {
+const benchLogger: Logger = {
     level: 'error',
     trace: () => {},
     debug: () => {},
@@ -78,8 +78,10 @@ export const NOOP_LOGGER: Logger = {
     },
     error: (...args: unknown[]) => {
         if (process.env.ZAPO_BENCH_VERBOSE) console.error('[lib error]', ...args)
-    }
+    },
+    child: () => benchLogger
 }
+export const NOOP_LOGGER: Logger = benchLogger
 
 // ─── Profiler ─────────────────────────────────────────────────────────
 
@@ -225,10 +227,7 @@ export class BenchProfiler {
         try {
             await this.session.post('HeapProfiler.takeHeapSnapshot', { reportProgress: false })
         } finally {
-            this.session.removeListener(
-                'HeapProfiler.addHeapSnapshotChunk',
-                onChunk as unknown as (m: object) => void
-            )
+            this.session.removeListener('HeapProfiler.addHeapSnapshotChunk', onChunk)
         }
         const out = this.fileName(`snapshot-${label}`, 'heapsnapshot')
         const content = chunks.join('')
@@ -255,10 +254,7 @@ export class BenchProfiler {
             })
             await this.session.post('HeapProfiler.stopTrackingHeapObjects')
         } finally {
-            this.session.removeListener(
-                'HeapProfiler.addHeapSnapshotChunk',
-                onChunk as unknown as (m: object) => void
-            )
+            this.session.removeListener('HeapProfiler.addHeapSnapshotChunk', onChunk)
         }
         const out = this.fileName('heap', 'heaptimeline')
         const content = chunks.join('')

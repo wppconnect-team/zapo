@@ -5,8 +5,10 @@ export {
     bytesToHex,
     decodeBase64Url,
     hexToBytes,
+    TEXT_DECODER,
     toBytesView,
-    uint8Equal
+    uint8Equal,
+    uint8TimingSafeEqual
 } from '@util/bytes'
 export {
     asBytes,

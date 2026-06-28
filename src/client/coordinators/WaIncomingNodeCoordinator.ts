@@ -187,14 +187,13 @@ export class WaIncomingNodeCoordinator {
         if (this.stanzaFilters.length === 0 || FILTER_PROTECTED_TAGS.has(node.tag)) {
             return false
         }
+        const filterLogger = this.logger.child({ tag: node.tag, id: node.attrs.id })
         for (let i = 0; i < this.stanzaFilters.length; i += 1) {
             let verdict: boolean
             try {
                 verdict = await this.stanzaFilters[i](node)
             } catch (error) {
-                this.logger.warn('incoming stanza filter threw', {
-                    tag: node.tag,
-                    id: node.attrs.id,
+                filterLogger.warn('incoming stanza filter threw', {
                     message: toError(error).message
                 })
                 continue
@@ -202,6 +201,10 @@ export class WaIncomingNodeCoordinator {
             if (!verdict) {
                 continue
             }
+            filterLogger.trace('incoming stanza dropped by filter', {
+                type: node.attrs.type,
+                from: node.attrs.from
+            })
             const ack = buildInboundAck(node)
             if (ack) {
                 await sendSafeAck(this.logger, this.runtime.sendNode, ack)
@@ -532,7 +535,7 @@ export class WaIncomingNodeCoordinator {
                         `ib.${WA_NODE_TAGS.EDGE_ROUTING}.${WA_NODE_TAGS.ROUTING_INFO}`
                     )
                     await this.runtime.persistRoutingInfo(routingInfo)
-                    this.logger.info('updated routing info from info bulletin', {
+                    this.logger.debug('updated routing info from info bulletin', {
                         byteLength: routingInfo.byteLength
                     })
                 } catch (error) {

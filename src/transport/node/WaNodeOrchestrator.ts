@@ -16,7 +16,12 @@ interface WaNodeOrchestratorOptions {
     readonly sendNode: (node: BinaryNode) => Promise<void>
     readonly defaultTimeoutMs?: number
     readonly hostDomain?: string
-    readonly mobileIqIdFormat?: boolean
+    /**
+     * Resolved lazily on first id-generator creation (post-connect, after
+     * credentials load) so a registered mobile session reconnecting without an
+     * explicit `mobileTransport` option still picks the mobile id format.
+     */
+    readonly mobileIqIdFormat?: () => boolean
 }
 
 /**
@@ -29,7 +34,7 @@ export class WaNodeOrchestrator {
     private readonly sendNodeFn: (node: BinaryNode) => Promise<void>
     private readonly defaultTimeoutMs: number
     private readonly hostDomain: string
-    private readonly mobileIqIdFormat: boolean
+    private readonly mobileIqIdFormat: () => boolean
     private idGenerator: NodeIdGenerator | null
     private idGeneratorReady: Promise<NodeIdGenerator> | null
     private readonly pendingQueries: Map<string, PendingNodeQuery>
@@ -39,7 +44,7 @@ export class WaNodeOrchestrator {
         this.sendNodeFn = options.sendNode
         this.defaultTimeoutMs = options.defaultTimeoutMs ?? WA_DEFAULTS.NODE_QUERY_TIMEOUT_MS
         this.hostDomain = options.hostDomain ?? WA_DEFAULTS.HOST_DOMAIN
-        this.mobileIqIdFormat = options.mobileIqIdFormat === true
+        this.mobileIqIdFormat = options.mobileIqIdFormat ?? (() => false)
         this.idGenerator = null
         this.idGeneratorReady = null
         this.pendingQueries = new Map()
@@ -50,8 +55,12 @@ export class WaNodeOrchestrator {
     }
 
     public clearPending(reason: Error): void {
-        this.logger.warn('clearing pending node queries', {
-            count: this.pendingQueries.size,
+        const count = this.pendingQueries.size
+        if (count === 0) {
+            return
+        }
+        this.logger.debug('clearing pending node queries', {
+            count,
             reason: reason.message
         })
         for (const pending of this.pendingQueries.values()) {
@@ -128,8 +137,8 @@ export class WaNodeOrchestrator {
         if (this.pendingQueries.has(id)) {
             throw new Error(`pending node id collision: ${id}`)
         }
-        this.logger.debug('sending query node', {
-            id,
+        const queryLogger = this.logger.child({ id })
+        queryLogger.debug('sending query node', {
             tag: outbound.tag,
             type: outbound.attrs.type,
             timeoutMs
@@ -138,7 +147,7 @@ export class WaNodeOrchestrator {
         return new Promise<BinaryNode>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pendingQueries.delete(id)
-                this.logger.warn('query node timeout', { id, timeoutMs })
+                queryLogger.warn('query node timeout', { timeoutMs })
                 reject(new Error(`query timeout (${id}) after ${timeoutMs}ms`))
             }, timeoutMs)
 
@@ -151,8 +160,7 @@ export class WaNodeOrchestrator {
             this.sendNodeFn(outbound).catch((error) => {
                 clearTimeout(timer)
                 this.pendingQueries.delete(id)
-                this.logger.warn('failed to send query node', {
-                    id,
+                queryLogger.warn('failed to send query node', {
                     message: toError(error).message
                 })
                 reject(toError(error))
@@ -181,7 +189,7 @@ export class WaNodeOrchestrator {
         if (this.idGenerator) {
             return this.idGenerator
         }
-        if (this.mobileIqIdFormat) {
+        if (this.mobileIqIdFormat()) {
             this.idGenerator = createMobileNodeIdGenerator()
             this.logger.debug('generated stanza prefix (mobile)', {
                 prefix: this.idGenerator.prefix

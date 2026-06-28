@@ -6,8 +6,8 @@
         "noEmit": false,
         "types": ["node"],
         "declaration": true,
-        "declarationMap": true,
-        "sourceMap": true
+        "declarationMap": false,
+        "sourceMap": false
     },
     "include": ["src"],
     "exclude": ["src/**/__tests__/**"]

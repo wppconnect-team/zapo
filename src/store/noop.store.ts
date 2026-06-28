@@ -60,6 +60,7 @@ export const NOOP_CONTACT_STORE: WaContactStore = Object.freeze({
     upsert: async (_record: WaStoredContactRecord): Promise<void> => {},
     upsertBatch: async (_records: readonly WaStoredContactRecord[]): Promise<void> => {},
     getByJid: async (_jid: string): Promise<WaStoredContactRecord | null> => null,
+    getByPhoneNumber: async (_pn: string): Promise<WaStoredContactRecord | null> => null,
     deleteByJid: async (_jid: string): Promise<number> => 0,
     clear: async (): Promise<void> => {}
 })
@@ -98,6 +99,8 @@ export const NOOP_DEVICE_LIST_STORE: WaDeviceListStore = Object.freeze({
         _nowMs?: number
     ): Promise<readonly (WaDeviceListSnapshot | null)[]> =>
         new Array<WaDeviceListSnapshot | null>(userJids.length).fill(null),
+    findByAnyUserJid: async (_jid: string, _nowMs?: number): Promise<WaDeviceListSnapshot | null> =>
+        null,
     deleteUserDevices: async (_userJid: string): Promise<number> => 0,
     cleanupExpired: async (_nowMs: number): Promise<number> => 0,
     clear: async (): Promise<void> => {},

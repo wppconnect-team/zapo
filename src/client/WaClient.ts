@@ -15,12 +15,15 @@ import type { WaPresenceCoordinator } from '@client/coordinators/WaPresenceCoord
 import type { WaPrivacyCoordinator } from '@client/coordinators/WaPrivacyCoordinator'
 import type { WaProfileCoordinator } from '@client/coordinators/WaProfileCoordinator'
 import type { WaStatusCoordinator } from '@client/coordinators/WaStatusCoordinator'
+import { createIgnoreKeyFilter, validateIgnoreKey } from '@client/messaging/ignore-key'
 import { runHistorySyncNotification } from '@client/persistence/history-sync'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import type {
     WaClientEventMap,
     WaClientOptions,
+    WaIgnoreKey,
+    WaIgnoreKeyPredicate,
     WaIncomingMessageEvent,
     WaIncomingProtocolMessageEvent
 } from '@client/types'
@@ -33,10 +36,9 @@ import { ConsoleLogger } from '@infra/log/ConsoleLogger'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import { proto, type Proto } from '@proto'
-import { WA_DEFAULTS } from '@protocol/constants'
+import { WA_DEFAULTS, WA_MESSAGE_TYPES } from '@protocol/constants'
 import { normalizeDeviceJid } from '@protocol/jid'
 import { WA_DISCONNECT_REASONS, WA_LOGOUT_REASONS, type WaLogoutReason } from '@protocol/stream'
-import { NOOP_MESSAGE_SECRET_STORE } from '@store/noop.store'
 import { buildRemoveCompanionDeviceIq } from '@transport/node/builders/device'
 import { assertIqResult, queryWithContext as queryNodeWithContext } from '@transport/node/query'
 import type { BinaryNode } from '@transport/types'
@@ -133,17 +135,6 @@ export class WaClient extends EventEmitter {
             this.options.writeBehind
         )
 
-        if (
-            this.options.addons?.autoDecrypt !== false &&
-            this.stores.messageSecret === NOOP_MESSAGE_SECRET_STORE
-        ) {
-            this.logger.warn(
-                'addons.autoDecrypt is on (default) but messageSecret cache is noop – ' +
-                    'addon decryption will only work if secrets are in the message store. ' +
-                    'Set addons.autoDecrypt: false to silence this warning.'
-            )
-        }
-
         const dependencies = buildWaClientDependencies({
             base,
             runtime: {
@@ -154,10 +145,7 @@ export class WaClient extends EventEmitter {
                 syncAppState: () => this.deps.chatCoordinator.sync().then(() => {}),
                 syncAppStateWithOptions: (syncOptions) =>
                     this.deps.chatCoordinator.sync(syncOptions),
-                emitEvent: this.emit.bind(this) as <K extends keyof WaClientEventMap>(
-                    event: K,
-                    ...args: Parameters<WaClientEventMap[K]>
-                ) => void,
+                emitEvent: this.emit.bind(this),
                 handleIncomingMessageEvent: this.handleIncomingMessageEvent.bind(this),
                 handleError: this.handleError.bind(this),
                 handleIncomingFrame: this.handleIncomingFrame.bind(this),
@@ -170,7 +158,8 @@ export class WaClient extends EventEmitter {
                     return () => {
                         this.off('message_protocol', handler)
                     }
-                }
+                },
+                persistContact: (record) => this.writeBehind.persistContact(record)
             }
         })
         this.deps = dependencies
@@ -295,6 +284,7 @@ export class WaClient extends EventEmitter {
                 logger: this.logger,
                 writeBehind: this.writeBehind,
                 messageSecretStore: this.stores.messageSecret,
+                persistAllSecrets: this.options.addons?.persistAllSecrets === true,
                 event
             })
             if (this.options.addons?.autoDecrypt !== false && event.message) {
@@ -345,25 +335,45 @@ export class WaClient extends EventEmitter {
             }
 
             if (protocolType === proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION) {
-                if (
-                    this.options.history?.enabled !== false &&
-                    protocolMessage.historySyncNotification
-                ) {
+                if (!protocolMessage.historySyncNotification) {
+                    return
+                }
+                const peerRemoteJid = event.key.remoteJid
+                const peerStanzaId = event.key.id
+                const sendHistSyncReceipt =
+                    peerRemoteJid && peerStanzaId
+                        ? async () => {
+                              try {
+                                  await this.message.sendReceipt(peerRemoteJid, peerStanzaId, {
+                                      type: WA_MESSAGE_TYPES.RECEIPT_TYPE_HISTORY_SYNC
+                                  })
+                              } catch (err) {
+                                  this.logger.warn('failed to send hist_sync receipt', {
+                                      id: peerStanzaId,
+                                      to: peerRemoteJid,
+                                      message: toError(err).message
+                                  })
+                              }
+                          }
+                        : undefined
+
+                if (this.options.history?.enabled !== false) {
                     await runHistorySyncNotification(
                         {
                             logger: this.logger,
                             mediaTransfer: this.mediaTransfer,
                             writeBehind: this.writeBehind,
-                            emitEvent: this.emit.bind(this) as Parameters<
-                                typeof runHistorySyncNotification
-                            >[0]['emitEvent'],
+                            emitEvent: this.emit.bind(this),
                             onPrivacyTokens: (conversations) =>
                                 this.deps.trustedContactToken.hydrateFromHistorySync(conversations),
                             onNctSalt: (salt) =>
-                                this.deps.trustedContactToken.hydrateNctSaltFromHistorySync(salt)
+                                this.deps.trustedContactToken.hydrateNctSaltFromHistorySync(salt),
+                            onProcessed: sendHistSyncReceipt
                         },
                         protocolMessage.historySyncNotification
                     )
+                } else if (sendHistSyncReceipt) {
+                    await sendHistSyncReceipt()
                 }
                 return
             }
@@ -445,6 +455,8 @@ export class WaClient extends EventEmitter {
             return this.connectPromise
         }
 
+        this.writeBehind.restart()
+
         this.acceptingIncomingEvents = true
         this.connectPromise = this.deps.connectionManager
             .connect((frame) => this.handleIncomingFrame(frame))
@@ -492,6 +504,34 @@ export class WaClient extends EventEmitter {
             isLogout: false,
             isNewLogin: false
         })
+    }
+
+    /**
+     * Drops matching inbound stanzas before any handler runs. Server still
+     * gets the ack so it stops re-delivering. Returns an `unregister` function.
+     *
+     * Accepts either a declarative descriptor or a predicate. The descriptor
+     * matches by `remoteJid`/`fromMe`/`id`/`participant` (PN ↔ LID alt-attrs
+     * resolved automatically) and throws when no match field is given or
+     * arrays are empty. The predicate receives a parsed
+     * {@link WaIgnoreKeyContext} and returns `true` to drop the stanza.
+     *
+     * @example
+     * ```ts
+     * client.ignoreKey({ remoteJid: spammerJid })
+     * client.ignoreKey({ fromMe: true, only: ['message'] })
+     * client.ignoreKey((m) => m.kind === 'message' && isGroupJid(m.remoteJid ?? ''))
+     * ```
+     */
+    public ignoreKey(input: WaIgnoreKey | WaIgnoreKeyPredicate): () => void {
+        if (typeof input !== 'function') {
+            validateIgnoreKey(input)
+        }
+        const filter = createIgnoreKeyFilter(
+            input,
+            () => this.deps.authClient.getCurrentCredentials()?.meJid
+        )
+        return this.deps.incomingNode.registerIncomingStanzaFilter(filter)
     }
 
     /** Auth client: pairing, credentials, registration state. */

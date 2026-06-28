@@ -46,13 +46,15 @@ import type {
 } from '@message/types'
 import type { WaMessageClient } from '@message/WaMessageClient'
 import { proto, type Proto } from '@proto'
-import { WA_DEFAULTS, type WaStatusDistributionSetting } from '@protocol/constants'
+import { WA_DEFAULTS, WA_NACK_REASONS, type WaStatusDistributionSetting } from '@protocol/constants'
 import {
+    canonicalizeOwnAccountJid,
     isBotJid,
     isGroupJid,
     isHostedDeviceJid,
     isLidJid,
     isNewsletterJid,
+    isUserJid,
     normalizeDeviceJid,
     normalizeRecipientJid,
     parseJidFull,
@@ -62,6 +64,7 @@ import {
 } from '@protocol/jid'
 import type { OutboundRetryTracker } from '@retry/tracker'
 import type { WaRetryReplayPayload } from '@retry/types'
+import type { SignalDeviceSyncApi } from '@signal/api/SignalDeviceSyncApi'
 import type { SenderKeyManager } from '@signal/group/SenderKeyManager'
 import type { SignalResolvedSessionTarget, SignalSessionResolver } from '@signal/session/resolver'
 import type { SignalProtocol } from '@signal/session/SignalProtocol'
@@ -80,6 +83,7 @@ import {
 } from '@transport/node/builders/message'
 import type { BinaryNode } from '@transport/types'
 import { bytesToHex, TEXT_ENCODER } from '@util/bytes'
+import type { ServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 
 interface WaMessageDispatchCoordinatorOptions {
@@ -104,7 +108,14 @@ interface WaMessageDispatchCoordinatorOptions {
     readonly sessionStore: WaSessionStore
     readonly identityStore: WaIdentityStore
     readonly deviceListStore: WaDeviceListStore
+    readonly signalDeviceSync: SignalDeviceSyncApi
     readonly messageSecretStore: WaMessageSecretStore
+    /**
+     * When `true`, persist the message secret for every outgoing message, not
+     * only the poll / event / bot prompts that `needsSecretPersistence` flags.
+     * Wired from the client-level `addons.persistAllSecrets` option.
+     */
+    readonly persistAllMessageSecrets?: boolean
     readonly getCurrentCredentials: () => WaAuthCredentials | null
     readonly resolvePrivacyTokenNode: (recipientJid: string) => Promise<BinaryNode | null>
     readonly onDirectMessageSent: (recipientJid: string) => void
@@ -115,7 +126,13 @@ interface WaMessageDispatchCoordinatorOptions {
         contextInfo: WaSendContextInfo | null
     ) => Promise<WaMessagePublishResult>
     readonly getIcdcHashLength?: () => number
-    readonly mobileMessageIdFormat?: boolean
+    /**
+     * Resolved per outgoing message (post-connect, after credentials load) so a
+     * registered mobile session reconnecting without an explicit
+     * `mobileTransport` option still emits the mobile message-id format.
+     */
+    readonly mobileMessageIdFormat?: () => boolean
+    readonly serverClock: ServerClock
 }
 
 type GroupAddressingMode = 'pn' | 'lid'
@@ -139,26 +156,27 @@ interface WaOutboundEnvelope {
 
 export class WaMessageDispatchCoordinator {
     private readonly deps: WaMessageDispatchCoordinatorOptions
-    private readonly mobileMessageIdFormat: boolean
+    private readonly mobileMessageIdFormat: () => boolean
+    private readonly serverClock: ServerClock
     private readonly icdcDedup = new PromiseDedup()
     private readonly privacyTokenDedup = new PromiseDedup()
     private readonly distributionDedup = new PromiseDedup()
 
     public constructor(options: WaMessageDispatchCoordinatorOptions) {
         this.deps = options
-        this.mobileMessageIdFormat = options.mobileMessageIdFormat ?? false
+        this.mobileMessageIdFormat = options.mobileMessageIdFormat ?? (() => false)
+        this.serverClock = options.serverClock
     }
 
     public async publishMessageNode(
         node: BinaryNode,
         options: WaMessagePublishOptions = {}
     ): Promise<WaMessagePublishResult> {
-        this.deps.logger.debug('wa client publish message node', {
+        this.deps.logger.trace('wa client publish message node', {
             tag: node.tag,
             type: node.attrs.type,
             to: node.attrs.to
         })
-        const messageType = node.attrs.type ?? 'text'
         const replayPayload: WaRetryReplayPayload = {
             mode: 'opaque_node',
             node: encodeBinaryNode(node)
@@ -167,10 +185,7 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: node.attrs.id,
                 toJid: node.attrs.to,
-                type: messageType,
-                replayPayload,
-                participantJid: node.attrs.participant,
-                recipientJid: node.attrs.recipient
+                replayPayload
             },
             async () => this.deps.messageClient.publishNode(node, options)
         )
@@ -180,7 +195,7 @@ export class WaMessageDispatchCoordinator {
         input: WaEncryptedMessageInput,
         options: WaMessagePublishOptions = {}
     ): Promise<WaMessagePublishResult> {
-        this.deps.logger.debug('wa client publish encrypted message', {
+        this.deps.logger.trace('wa client publish encrypted message', {
             to: input.to,
             type: input.type,
             encType: input.encType
@@ -197,9 +212,7 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: input.id,
                 toJid: input.to,
-                type: input.type ?? 'text',
                 replayPayload,
-                participantJid: input.participant,
                 eligibleRequesterDeviceJids: [input.to]
             },
             async () => this.deps.messageClient.publishEncrypted(input, options)
@@ -211,19 +224,26 @@ export class WaMessageDispatchCoordinator {
         options: WaMessagePublishOptions = {}
     ): Promise<WaMessagePublishResult> {
         this.requireCurrentMeJid('publishSignalMessage')
-        const address = parseSignalAddressFromJid(input.to)
+        const credentials = this.deps.getCurrentCredentials()
+        const sessionJid = canonicalizeOwnAccountJid(
+            input.to,
+            credentials?.meJid,
+            credentials?.meLid
+        )
+        const address = parseSignalAddressFromJid(sessionJid)
         if (address.server === WA_DEFAULTS.GROUP_SERVER) {
             throw new Error(
                 'publishSignalMessage currently supports only direct chats; use sender-key flow for groups'
             )
         }
-        this.deps.logger.debug('wa client publish signal message', {
+        this.deps.logger.trace('wa client publish signal message', {
             to: input.to,
+            sessionJid,
             type: input.type
         })
         const [paddedPlaintext] = await Promise.all([
             writeRandomPadMax16(input.plaintext),
-            this.deps.sessionResolver.ensureSession(address, input.to, input.expectedIdentity)
+            this.deps.sessionResolver.ensureSession(address, sessionJid, input.expectedIdentity)
         ])
         const encrypted = await this.deps.signalProtocol.encryptMessage(
             address,
@@ -231,6 +251,8 @@ export class WaMessageDispatchCoordinator {
             input.expectedIdentity
         )
         const messageType = input.type ?? 'text'
+        const deviceIdentity =
+            encrypted.type === 'pkmsg' ? this.getEncodedSignedDeviceIdentity() : undefined
         const replayPayload: WaRetryReplayPayload = {
             mode: 'plaintext',
             to: input.to,
@@ -241,9 +263,7 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: input.id,
                 toJid: input.to,
-                type: messageType,
                 replayPayload,
-                participantJid: input.participant,
                 eligibleRequesterDeviceJids: [input.to]
             },
             async () =>
@@ -257,7 +277,9 @@ export class WaMessageDispatchCoordinator {
                         category: input.category,
                         pushPriority: input.pushPriority,
                         participant: input.participant,
-                        deviceFanout: input.deviceFanout
+                        deviceFanout: input.deviceFanout,
+                        deviceIdentity,
+                        metaNode: input.metaNode
                     },
                     options
                 )
@@ -329,7 +351,9 @@ export class WaMessageDispatchCoordinator {
             optionsLevel: optionsCtx,
             quote: options.quote,
             forward: options.forward,
-            mentions: options.mentions
+            mentions: options.mentions,
+            meLid: this.deps.getCurrentCredentials()?.meLid,
+            targetJid: recipientJid
         })
         const withCtx = ctx ? applyContextInfo(built.message, ctx) : built.message
         const withViewOnce = options.viewOnce ? wrapAsViewOnce(withCtx) : withCtx
@@ -358,7 +382,7 @@ export class WaMessageDispatchCoordinator {
                           ...(editParticipant ? { participant: editParticipant } : {})
                       },
                       editedMessage: withViewOnce,
-                      timestampMs: editTimestamp ?? Date.now()
+                      timestampMs: editTimestamp ?? this.serverClock.nowMs()
                   }
               }
             : withViewOnce
@@ -381,7 +405,7 @@ export class WaMessageDispatchCoordinator {
             rawSecret &&
             rawSecret.length > 0 &&
             sendOptions.id &&
-            needsSecretPersistence(messageWithSecret)
+            (this.deps.persistAllMessageSecrets || needsSecretPersistence(messageWithSecret))
         ) {
             const meJid = this.deps.getCurrentCredentials()?.meJid ?? ''
             void this.deps.messageSecretStore
@@ -389,6 +413,7 @@ export class WaMessageDispatchCoordinator {
                 .catch((error) => {
                     this.deps.logger.warn('failed to persist outgoing message secret', {
                         id: sendOptions.id,
+                        to: recipientJid,
                         message: toError(error).message
                     })
                 })
@@ -447,12 +472,78 @@ export class WaMessageDispatchCoordinator {
             sendOptions
         }
 
+        const directRecipientJid = isGroup
+            ? recipientJid
+            : await this.resolveDirectRecipientLid(toUserJid(recipientJid))
+        const peerRecipientPn = isGroup
+            ? undefined
+            : await this.resolvePeerRecipientPn(toUserJid(recipientJid), directRecipientJid)
         const publishResult = isGroup
             ? this.shouldUseGroupDirectPath(messageWithIcdc)
                 ? await this.publishGroupDirectMessage(recipientJid, envelope)
                 : await this.publishGroupSenderKeyMessage(recipientJid, envelope)
-            : await this.publishDirectSignalMessageWithFanout(toUserJid(recipientJid), envelope)
+            : await this.publishDirectSignalMessageWithFanout(
+                  directRecipientJid,
+                  envelope,
+                  peerRecipientPn
+              )
         return upload ? { ...publishResult, upload } : publishResult
+    }
+
+    /**
+     * For a 1:1 recipient passed in PN form, returns the LID-addressed user JID
+     * (cache-first; falls back to a one-shot `queryLidsByPhoneJids`). Switching
+     * to LID before fanout ensures the envelope, eligible-requester list, and
+     * retry-receipt addressing all agree, which keeps the retry tracker from
+     * rejecting receipts that arrive in LID form. Returns the original PN if
+     * no LID is known/resolvable. Inputs already in LID form pass through.
+     */
+    private async resolveDirectRecipientLid(pnUserJid: string): Promise<string> {
+        if (isLidJid(pnUserJid)) return pnUserJid
+        const cached = await this.deps.deviceListStore.findByAnyUserJid(pnUserJid)
+        if (cached) {
+            if (isLidJid(cached.userJid)) return cached.userJid
+            if (cached.altUserJid && isLidJid(cached.altUserJid)) return cached.altUserJid
+        }
+        try {
+            const results = await this.deps.signalDeviceSync.queryLidsByPhoneJids([pnUserJid])
+            const match = results.find((entry) => entry.phoneJid === pnUserJid)
+            if (match?.lidJid) return match.lidJid
+        } catch (error) {
+            this.deps.logger.debug('lid resolution failed for direct recipient', {
+                pnUserJid,
+                message: toError(error).message
+            })
+        }
+        return pnUserJid
+    }
+
+    /**
+     * Resolves the `peer_recipient_pn` cross-reference for a 1:1 send, or
+     * `undefined` to drop the attribute. Only set when the envelope is
+     * LID-addressed (`directRecipientJid` is a LID): the PN is the caller's own
+     * JID when they passed a PN (zapo switched it to LID for sending), else the
+     * device-list snapshot counterpart for a recipient passed in LID form.
+     * Mirrors wa-web, which sets `peer_recipient_pn = getPhoneNumber($)` for a
+     * LID destination.
+     */
+    private async resolvePeerRecipientPn(
+        recipientUserJid: string,
+        directRecipientJid: string
+    ): Promise<string | undefined> {
+        if (!isLidJid(directRecipientJid)) return undefined
+        if (isUserJid(recipientUserJid)) return recipientUserJid
+        try {
+            const snapshot = await this.deps.deviceListStore.findByAnyUserJid(directRecipientJid)
+            if (snapshot?.userJid && isUserJid(snapshot.userJid)) return snapshot.userJid
+            if (snapshot?.altUserJid && isUserJid(snapshot.altUserJid)) return snapshot.altUserJid
+        } catch (error) {
+            this.deps.logger.trace('peer_recipient_pn store lookup failed', {
+                lid: directRecipientJid,
+                message: toError(error).message
+            })
+        }
+        return undefined
     }
 
     public async syncSignalSession(jid: string, reasonIdentity = false): Promise<void> {
@@ -470,15 +561,31 @@ export class WaMessageDispatchCoordinator {
     public async publishProtocolMessageToDevice(
         deviceJid: string,
         protocolMessage: Proto.Message.IProtocolMessage,
-        options?: { readonly id?: string }
+        options?: { readonly id?: string; readonly pushPriority?: 'high' | 'high_force' }
     ): Promise<WaMessagePublishResult> {
+        const credentials = this.deps.getCurrentCredentials()
+        const meJid = credentials?.meJid
+        const meParsed = meJid ? parseJidFull(meJid) : undefined
+        const meUserJid = meParsed?.userJid
+        let senderIcdc: IcdcMeta | null = null
+        if (meUserJid) {
+            const regInfo = await this.deps.signalStore.getRegistrationInfo()
+            const localPubKey = regInfo?.identityKeyPair.pubKey
+            const localIdentity =
+                meParsed && localPubKey
+                    ? { address: meParsed.address, pubKey: localPubKey }
+                    : undefined
+            senderIcdc = await this.resolveUserIcdc(meUserJid, localIdentity)
+        }
+        const message = injectDeviceListMetadata({ protocolMessage }, senderIcdc, null)
         return this.publishSignalMessage({
             to: deviceJid,
-            plaintext: proto.Message.encode({ protocolMessage }).finish(),
+            plaintext: proto.Message.encode(message).finish(),
             id: options?.id,
             type: 'text',
             category: 'peer',
-            pushPriority: 'high'
+            pushPriority: options?.pushPriority ?? 'high',
+            metaNode: buildMetaNode({ appdata: 'default' })
         })
     }
 
@@ -696,7 +803,6 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: messageNode.attrs.id ?? sendOptions.id,
                 toJid: input.groupJid,
-                type: messageNode.attrs.type,
                 replayPayload,
                 eligibleRequesterDeviceJids: undefined
             },
@@ -713,14 +819,12 @@ export class WaMessageDispatchCoordinator {
                 distributedAddresses
             )
         } catch (error) {
-            this.deps.logger.warn(
-                `failed to mark ${input.logTag} sender key distribution targets`,
-                {
-                    groupJid: input.groupJid,
-                    participants: distributedAddresses.length,
-                    message: toError(error).message
-                }
-            )
+            this.deps.logger.warn('failed to mark sender key distribution targets', {
+                logTag: input.logTag,
+                groupJid: input.groupJid,
+                participants: distributedAddresses.length,
+                message: toError(error).message
+            })
         }
         return result
     }
@@ -743,15 +847,9 @@ export class WaMessageDispatchCoordinator {
         await this.deps.groupMetadataCache.mutateFromGroupEvent(event)
     }
 
+    // noop for now
     private shouldUseGroupDirectPath(message: Proto.IMessage): boolean {
-        const protocolType = message.protocolMessage?.type
-        if (
-            protocolType === proto.Message.ProtocolMessage.Type.REVOKE ||
-            protocolType === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT
-        ) {
-            return true
-        }
-        return message.keepInChatMessage?.keepType === proto.KeepType.UNDO_KEEP_FOR_ALL
+        return false
     }
 
     private async publishGroupDirectMessage(
@@ -783,13 +881,19 @@ export class WaMessageDispatchCoordinator {
         for (let index = 0; index < fanoutDeviceJids.length; index += 1) {
             uniqueNormalizedFanoutJids.add(normalizeDeviceJid(fanoutDeviceJids[index]))
         }
+        const droppedDevices: string[] = []
         for (const expected of uniqueNormalizedFanoutJids) {
             if (!resolvedNormalizedJids.has(expected)) {
-                this.deps.logger.warn(
-                    'group direct fanout dropping device without signal session',
-                    { groupJid, device: expected }
-                )
+                droppedDevices.push(expected)
             }
+        }
+        if (droppedDevices.length > 0) {
+            this.deps.logger.warn('group direct fanout dropping devices without signal session', {
+                groupJid,
+                droppedCount: droppedDevices.length,
+                totalExpected: uniqueNormalizedFanoutJids.size,
+                sample: droppedDevices.slice(0, 3)
+            })
         }
         if (resolvedFanoutTargets.length === 0) {
             throw new Error('group direct send resolved no signal sessions')
@@ -875,7 +979,6 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: messageNode.attrs.id ?? sendOptions.id,
                 toJid: groupJid,
-                type,
                 replayPayload,
                 eligibleRequesterDeviceJids: undefined
             },
@@ -887,7 +990,7 @@ export class WaMessageDispatchCoordinator {
         const hasPhashMismatch = !!serverPhash && serverPhash !== localPhash
         const hasAddressingMismatch =
             !!serverAddressingMode && serverAddressingMode !== addressingMode
-        const hasAddressingError = ackError === 421
+        const hasAddressingError = ackError === WA_NACK_REASONS.STALE_GROUP_ADDRESSING_MODE
         if (
             !retryContext.retried &&
             (hasPhashMismatch || hasAddressingMismatch || hasAddressingError)
@@ -930,7 +1033,7 @@ export class WaMessageDispatchCoordinator {
         try {
             address = parseSignalAddressFromJid(botJid)
         } catch (error) {
-            this.deps.logger.warn('bot sidecar: failed to parse bot jid', {
+            this.deps.logger.debug('bot sidecar: failed to parse bot jid', {
                 botJid,
                 message: toError(error).message
             })
@@ -941,14 +1044,14 @@ export class WaMessageDispatchCoordinator {
         try {
             resolvedTargets = await this.deps.sessionResolver.ensureSessionsBatch([botJid])
         } catch (error) {
-            this.deps.logger.warn('bot sidecar: signal session sync failed', {
+            this.deps.logger.debug('bot sidecar: signal session sync failed', {
                 botJid,
                 message: toError(error).message
             })
             return null
         }
         if (resolvedTargets.length === 0) {
-            this.deps.logger.warn('bot sidecar: signal session not established', { botJid })
+            this.deps.logger.debug('bot sidecar: signal session not established', { botJid })
             return null
         }
 
@@ -969,14 +1072,14 @@ export class WaMessageDispatchCoordinator {
                 }))
             )
             if (!encrypted) return null
-            this.deps.logger.debug('bot sidecar encrypted', { botJid, encType: encrypted.type })
+            this.deps.logger.trace('bot sidecar encrypted', { botJid, encType: encrypted.type })
             return {
                 jid: botJid,
                 encType: encrypted.type,
                 ciphertext: encrypted.ciphertext
             }
         } catch (error) {
-            this.deps.logger.warn('bot sidecar: encryption failed', {
+            this.deps.logger.debug('bot sidecar: encryption failed', {
                 botJid,
                 message: toError(error).message
             })
@@ -1073,7 +1176,6 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: messageNode.attrs.id ?? sendOptions.id,
                 toJid: groupJid,
-                type,
                 replayPayload,
                 eligibleRequesterDeviceJids: undefined
             },
@@ -1102,7 +1204,7 @@ export class WaMessageDispatchCoordinator {
         const hasPhashMismatch = !!serverPhash && serverPhash !== localPhash
         const hasAddressingMismatch =
             !!serverAddressingMode && serverAddressingMode !== addressingMode
-        const hasAddressingError = ackError === 421
+        const hasAddressingError = ackError === WA_NACK_REASONS.STALE_GROUP_ADDRESSING_MODE
         if (
             !retryContext.retried &&
             (hasPhashMismatch || hasAddressingMismatch || hasAddressingError)
@@ -1334,7 +1436,8 @@ export class WaMessageDispatchCoordinator {
 
     private async publishDirectSignalMessageWithFanout(
         recipientJid: string,
-        envelope: WaOutboundEnvelope
+        envelope: WaOutboundEnvelope,
+        peerRecipientPn?: string
     ): Promise<WaMessagePublishResult> {
         const { message, plaintext, type, edit, mediatype, sendOptions } = envelope
         const meJid = this.requireCurrentMeJid('sendMessage')
@@ -1365,7 +1468,7 @@ export class WaMessageDispatchCoordinator {
         const recipientUserJid = toUserJid(recipientJid)
         const meUserJid = toUserJid(selfDeviceJidForRecipient)
 
-        this.deps.logger.debug('wa client publish signal fanout', {
+        this.deps.logger.trace('wa client publish signal fanout', {
             to: recipientJid,
             devices: deviceJids.length,
             type
@@ -1389,6 +1492,7 @@ export class WaMessageDispatchCoordinator {
             resolvedFanoutTargetsByJid.set(normalizeDeviceJid(target.jid), target)
         }
         const liveTargets: typeof targets = []
+        const droppedSecondaryDevices: string[] = []
         for (let index = 0; index < targets.length; index += 1) {
             const target = targets[index]
             if (resolvedFanoutTargetsByJid.has(target.normalizedJid)) {
@@ -1397,18 +1501,25 @@ export class WaMessageDispatchCoordinator {
             }
             const isPrimaryRecipient =
                 target.userJid === recipientUserJid && target.normalizedJid === target.userJid
-            const logContext = { to: recipientJid, device: target.jid }
             if (isPrimaryRecipient) {
                 this.deps.logger.error(
                     'direct fanout dropping primary recipient device without signal session',
-                    logContext
+                    { to: recipientJid, device: target.jid }
                 )
             } else {
-                this.deps.logger.warn(
-                    'direct fanout dropping device without signal session',
-                    logContext
-                )
+                droppedSecondaryDevices.push(target.jid)
             }
+        }
+        if (droppedSecondaryDevices.length > 0) {
+            this.deps.logger.warn(
+                'direct fanout dropping secondary devices without signal session',
+                {
+                    to: recipientJid,
+                    droppedCount: droppedSecondaryDevices.length,
+                    totalExpected: targets.length,
+                    sample: droppedSecondaryDevices.slice(0, 3)
+                }
+            )
         }
         if (liveTargets.length === 0) {
             throw new Error('direct fanout missing signal sessions for all targets')
@@ -1537,6 +1648,7 @@ export class WaMessageDispatchCoordinator {
             customNodes: customNodes.length > 0 ? customNodes : undefined,
             mediatype,
             decryptFail: envelope.decryptFail,
+            peerRecipientPn,
             additionalAttributes: sendOptions.additionalAttributes
         })
 
@@ -1550,7 +1662,6 @@ export class WaMessageDispatchCoordinator {
             {
                 messageIdHint: messageNode.attrs.id ?? sendOptions.id,
                 toJid: recipientJid,
-                type,
                 replayPayload,
                 eligibleRequesterDeviceJids: deviceJids
             },
@@ -1589,7 +1700,7 @@ export class WaMessageDispatchCoordinator {
                 timestampBytes.byteOffset,
                 timestampBytes.byteLength
             )
-            if (this.mobileMessageIdFormat) {
+            if (this.mobileMessageIdFormat()) {
                 dv.setBigUint64(0, BigInt(Date.now()), false)
                 const digest = md5Bytes([
                     timestampBytes,
@@ -1610,7 +1721,7 @@ export class WaMessageDispatchCoordinator {
             this.deps.logger.warn('failed to generate message id, falling back to random', {
                 message: toError(error).message
             })
-            if (this.mobileMessageIdFormat) {
+            if (this.mobileMessageIdFormat()) {
                 const bytes = await randomBytesAsync(16)
                 bytes[0] = 0xac
                 return bytesToHex(bytes).toUpperCase()
