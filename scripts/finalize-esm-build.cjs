@@ -87,11 +87,6 @@ function normalizeEsmSpecifiers(filePath, source) {
 }
 
 function resolveSpecifier(filePath, specifier) {
-    const specBridge = specifier.match(/^\.\.\/spec\/([^/]+)$/)
-    if (specBridge?.[1] && existsSync(path.join(projectRoot, 'spec', specBridge[1], 'index.js'))) {
-        return `../../spec/${specBridge[1]}/index.js`
-    }
-
     const extension = path.extname(specifier)
     const runtimeExtensions = new Set(['.js', '.mjs', '.cjs', '.json', '.node'])
 
