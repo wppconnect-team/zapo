@@ -830,9 +830,7 @@ export class WaAppStateMutationCoordinator {
         try {
             return await inFlight
         } finally {
-            if (this.flushPromise === inFlight) {
-                this.flushPromise = null
-            }
+            this.flushPromise = null
         }
     }
 

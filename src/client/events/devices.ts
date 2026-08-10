@@ -57,7 +57,7 @@ export function parseDeviceNotification(node: BinaryNode): DeviceNotification | 
 
     const devices: DeviceNotificationDevice[] = []
 
-    if (action !== DEVICE_NOTIFICATION_ACTIONS.UPDATE && actionNode) {
+    if (action !== DEVICE_NOTIFICATION_ACTIONS.UPDATE) {
         const deviceNodes = getNodeChildrenByTag(actionNode, WA_NODE_TAGS.DEVICE)
         for (let index = 0; index < deviceNodes.length; index += 1) {
             const deviceNode = deviceNodes[index]

@@ -4,7 +4,7 @@
         "rootDir": "src",
         "outDir": "dist/esm",
         "module": "ES2020",
-        "moduleResolution": "Node",
+        "moduleResolution": "Bundler",
         "noEmit": false,
         "types": ["node"],
         "declaration": false,
