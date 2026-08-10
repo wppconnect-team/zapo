@@ -424,6 +424,40 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
         await messages.clear()
     })
 
+    it('cache stores: chat-metadata round-trips disappearing settings', async (t) => {
+        if (!store) return t.skip('ZAPO_TEST_REDIS_* not set')
+
+        const sessionId = nextSessionId('chatmeta')
+        const chatMetadata = store.caches.chatMetadata(sessionId)
+        const now = Date.now()
+
+        await chatMetadata.upsertChatMetadata({
+            chatJid: 'chat-1@lid',
+            ephemeralExpiration: 86_400,
+            ephemeralSettingTimestamp: 1_751_808_692,
+            updatedAtMs: now
+        })
+
+        const snapshot = await chatMetadata.getChatMetadata('chat-1@lid', now)
+        assert.ok(snapshot)
+        assert.equal(snapshot.ephemeralExpiration, 86_400)
+        assert.equal(snapshot.ephemeralSettingTimestamp, 1_751_808_692)
+
+        await chatMetadata.upsertChatMetadata({
+            chatJid: 'chat-1@lid',
+            ephemeralExpiration: 0,
+            updatedAtMs: now + 1
+        })
+        const disabled = await chatMetadata.getChatMetadata('chat-1@lid', now + 1)
+        assert.equal(disabled?.ephemeralExpiration, 0)
+        assert.equal(disabled?.ephemeralSettingTimestamp, undefined)
+
+        assert.ok((await chatMetadata.deleteChatMetadata('chat-1@lid')) >= 0)
+        assert.equal(await chatMetadata.getChatMetadata('chat-1@lid', now), null)
+        assert.ok((await chatMetadata.cleanupExpired(now + 60_000)) >= 0)
+        await chatMetadata.clear()
+    })
+
     it('cache stores: group-metadata and device-list basic lifecycle', async (t) => {
         if (!store) return t.skip('ZAPO_TEST_REDIS_* not set')
 
@@ -436,12 +470,14 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
             groupJid: 'group-1@g.us',
             participants: ['a@s.whatsapp.net', 'b@s.whatsapp.net'],
             ephemeral: 7_776_000,
+            ephemeralTrigger: 5,
             updatedAtMs: now
         })
         const metadataSnapshot = await groupMetadata.getGroupMetadata('group-1@g.us', now)
         assert.ok(metadataSnapshot)
         assert.deepEqual(metadataSnapshot.participants, ['a@s.whatsapp.net', 'b@s.whatsapp.net'])
         assert.equal(metadataSnapshot.ephemeral, 7_776_000)
+        assert.equal(metadataSnapshot.ephemeralTrigger, 5)
 
         await groupMetadata.upsertGroupMetadata({
             groupJid: 'group-1@g.us',
@@ -450,6 +486,7 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
         })
         const cleared = await groupMetadata.getGroupMetadata('group-1@g.us', now + 1)
         assert.equal(cleared?.ephemeral, undefined)
+        assert.equal(cleared?.ephemeralTrigger, undefined)
 
         assert.equal(await groupMetadata.deleteGroupMetadata('group-1@g.us'), 1)
         assert.equal(await groupMetadata.getGroupMetadata('group-1@g.us', now), null)
@@ -1380,5 +1417,128 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
         assert.equal(await session.getSession(addressMissing), null)
 
         await session.clear()
+    })
+})
+
+describe('store-redis storeTtlMs', { timeout: 60_000 }, () => {
+    const TTL = 5_000
+    let redis: Redis | undefined
+    let store: WaRedisStoreResult | undefined
+
+    before(async () => {
+        if (!host || !port) return
+        redis = new Redis({ host, port: Number(port) })
+        store = createRedisStore({
+            redis,
+            storeTtlMs: {
+                messagesMs: TTL,
+                signalMs: TTL,
+                appStateMs: TTL
+            }
+        })
+    })
+
+    after(async () => {
+        if (store) await store.destroy()
+        if (redis) await redis.quit()
+    })
+
+    it('data store expires written keys after the configured TTL window', async (t) => {
+        if (!store || !redis) return t.skip('ZAPO_TEST_REDIS_* not set')
+
+        const sessionId = nextSessionId('ttl-messages')
+        const messages = store.stores.messages(sessionId)
+        await messages.clear()
+
+        await messages.upsert({
+            id: 'ttl-msg-1',
+            threadJid: 'ttl-thread@s.whatsapp.net',
+            fromMe: true,
+            timestampMs: 1_000,
+            messageBytes: new Uint8Array([1, 2, 3])
+        })
+
+        const msgPttl = await redis.pttl(`msg:${sessionId}:ttl-msg-1`)
+        assert.ok(msgPttl > 0 && msgPttl <= TTL, `msg pttl out of range: ${msgPttl}`)
+        const binPttl = await redis.pttl(`msg:${sessionId}:ttl-msg-1:message_bytes`)
+        assert.ok(binPttl > 0 && binPttl <= TTL, `bin pttl out of range: ${binPttl}`)
+        const idxPttl = await redis.pttl(`msg:idx:${sessionId}:ttl-thread@s.whatsapp.net`)
+        assert.ok(idxPttl > 0 && idxPttl <= TTL, `idx pttl out of range: ${idxPttl}`)
+
+        await messages.clear()
+    })
+
+    it('crypto store refreshes TTL on read so an active session stays alive', async (t) => {
+        if (!store || !redis) return t.skip('ZAPO_TEST_REDIS_* not set')
+
+        const sessionId = nextSessionId('ttl-signal')
+        const signal = store.stores.signal(sessionId)
+        await signal.clear()
+
+        await signal.setRegistrationInfo({
+            registrationId: 7,
+            identityKeyPair: {
+                pubKey: new Uint8Array(33).fill(1),
+                privKey: new Uint8Array(32).fill(2)
+            }
+        })
+
+        const regKey = `signal:reg:${sessionId}`
+        const afterWrite = await redis.pttl(regKey)
+        assert.ok(afterWrite > 0 && afterWrite <= TTL, `reg pttl out of range: ${afterWrite}`)
+
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        const beforeRead = await redis.pttl(regKey)
+        const loaded = await signal.getRegistrationInfo()
+        assert.ok(loaded)
+        assert.equal(loaded.registrationId, 7)
+        const afterRead = await redis.pttl(regKey)
+        assert.ok(
+            afterRead > beforeRead,
+            `read did not refresh TTL: before=${beforeRead} after=${afterRead}`
+        )
+
+        await signal.clear()
+    })
+
+    it('auth keys never receive a TTL even when storeTtlMs is set', async (t) => {
+        if (!store || !redis) return t.skip('ZAPO_TEST_REDIS_* not set')
+
+        const sessionId = nextSessionId('ttl-auth')
+        const auth = store.stores.auth(sessionId)
+        await auth.clear()
+
+        await auth.save({
+            noiseKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) },
+            registrationInfo: {
+                registrationId: 1,
+                identityKeyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) }
+            },
+            signedPreKey: {
+                keyId: 1,
+                keyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) },
+                signature: new Uint8Array(64),
+                uploaded: false
+            },
+            advSecretKey: new Uint8Array(32)
+        })
+
+        assert.equal(await redis.pttl(`auth:${sessionId}`), -1)
+        assert.equal(await redis.pttl(`auth:${sessionId}:noise_pub_key`), -1)
+
+        await auth.clear()
+    })
+
+    it('rejects a non-positive ttlMs at store construction', (t) => {
+        if (!store || !redis) return t.skip('ZAPO_TEST_REDIS_* not set')
+        const reused = redis
+        assert.throws(
+            () =>
+                createRedisStore({
+                    redis: reused,
+                    storeTtlMs: { messagesMs: 0 }
+                }).stores.messages('x'),
+            /ttlMs must be a positive integer/
+        )
     })
 })

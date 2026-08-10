@@ -152,6 +152,103 @@ jobs:
             - run: npx turbo run build --filter=@zapo-js/fake-server --filter=@zapo-js/store-sqlite --filter=@zapo-js/media-utils --filter=@zapo-js/mcp-server
             - run: npm test -w packages/mcp-server
 
+    test-voip:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: build-core
+
+        steps:
+            - uses: actions/checkout@v4
+            - uses: ./.github/actions/setup-node
+            - uses: actions/download-artifact@v4
+              with:
+                  name: core-build
+                  path: dist/
+            - run: npx turbo run build --filter=@zapo-js/voip
+            - run: npm test -w packages/voip
+
+    test-wam:
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        needs: build-core
+
+        steps:
+            - uses: actions/checkout@v4
+            - uses: ./.github/actions/setup-node
+            - uses: actions/download-artifact@v4
+              with:
+                  name: core-build
+                  path: dist/
+            - run: npx turbo run build --filter=@zapo-js/wam
+            - run: npm test -w packages/wam
+
+    test-native:
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        needs: build-core
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  # third-party actions run after this checkout; do not leave
+                  # the token readable in git config
+                  persist-credentials: false
+            - uses: ./.github/actions/setup-node
+            - uses: actions/download-artifact@v4
+              with:
+                  name: core-build
+                  path: dist/
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+                  targets: wasm32-unknown-unknown
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: packages/native
+
+            # fmt + clippy; the workspace default-members are the NAPI crate +
+            # core, so this compiles and lints the NAPI code without building
+            # the addon. The wasm crate is linted on its own target (it sits
+            # outside default-members so its getrandom/js feature never
+            # unifies into the native build).
+            - name: rust lint
+              working-directory: packages/native
+              run: |
+                  cargo fmt --check
+                  cargo clippy --all-targets
+                  cargo clippy -p zapo-native-wasm --target wasm32-unknown-unknown
+
+            # prebuilt binary in seconds instead of `cargo install` (~3 min);
+            # version must match the wasm-bindgen crate pin in
+            # packages/native/wasm/Cargo.toml (=0.2.100)
+            - name: install wasm-bindgen-cli
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: wasm-bindgen@0.2.100
+
+            - name: build wasm backend
+              run: npm run build:wasm -w packages/native
+
+            - name: cross-check wasm vs pure JS
+              run: node --import tsx packages/native/__test__/cross-check.cjs
+              env:
+                  ZAPO_NATIVE_BACKEND: wasm
+
+            # clippy compiles the NAPI crate but cannot catch generated-binding
+            # or module-load failures; build the addon and run it once
+            - name: build and cross-check napi backend
+              run: |
+                  npm run build:napi -w packages/native
+                  node --import tsx packages/native/__test__/cross-check.cjs
+              env:
+                  ZAPO_NATIVE_BACKEND: napi
+
+            - name: core suite over the wasm backend
+              run: npm test
+              env:
+                  ZAPO_NATIVE_BACKEND: wasm
+
     test-mysql:
         runs-on: ubuntu-latest
         timeout-minutes: 15
@@ -289,6 +386,9 @@ jobs:
             - test-media-utils
             - test-sqlite
             - test-mcp-server
+            - test-voip
+            - test-wam
+            - test-native
             - test-mysql
             - test-postgres
             - test-redis

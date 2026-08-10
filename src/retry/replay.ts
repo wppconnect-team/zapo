@@ -5,7 +5,7 @@ import { wrapDeviceSentMessage } from '@message/encode/device-sent'
 import { unpadPkcs7, writeRandomPadMax16 } from '@message/encode/padding'
 import type { WaMessageClient } from '@message/WaMessageClient'
 import { proto, type Proto } from '@proto'
-import { WA_DEFAULTS, WA_NODE_TAGS } from '@protocol/constants'
+import { WA_ADDRESSING_MODES, WA_DEFAULTS, WA_NODE_TAGS } from '@protocol/constants'
 import {
     isGroupOrBroadcastJid,
     isHostedDeviceJid,
@@ -36,6 +36,7 @@ export interface WaRetryReplayServiceOptions {
     readonly signalProtocol: SignalProtocol
     readonly sessionResolver: SignalSessionResolver
     readonly getCurrentCredentials: () => WaAuthCredentials | null
+    readonly isMobilePrimary?: () => boolean
     readonly resolveUserIcdc?: (userJid: string) => Promise<IcdcMeta | null>
     /**
      * Resolves the trusted-contact (privacy) token node for a recipient user
@@ -164,9 +165,12 @@ export class WaRetryReplayService {
     private resolveSignedDeviceIdentity(context: string): Uint8Array | undefined {
         const signedIdentity = this.options.getCurrentCredentials()?.signedIdentity
         if (!signedIdentity) {
-            this.options.logger.warn('retry request missing signed identity for pkmsg envelope', {
-                context
-            })
+            if (!this.options.isMobilePrimary?.()) {
+                this.options.logger.warn(
+                    'retry request missing signed identity for pkmsg envelope',
+                    { context }
+                )
+            }
             return undefined
         }
         return proto.ADVSignedDeviceIdentity.encode(signedIdentity).finish()
@@ -277,18 +281,8 @@ export class WaRetryReplayService {
             requesterAddress,
             plaintext
         )
-        let deviceIdentity: Uint8Array | undefined
-
-        if (encrypted.type === 'pkmsg') {
-            const signedIdentity = this.options.getCurrentCredentials()?.signedIdentity
-            if (!signedIdentity) {
-                this.options.logger.warn(
-                    'retry request rejected: missing signed identity for pkmsg group retry'
-                )
-                return 'ineligible'
-            }
-            deviceIdentity = proto.ADVSignedDeviceIdentity.encode(signedIdentity).finish()
-        }
+        const deviceIdentity =
+            encrypted.type === 'pkmsg' ? this.resolveSignedDeviceIdentity('group') : undefined
 
         const isStatus = isStatusBroadcastJid(payload.to)
         const metaAttrs: Record<string, string> = {}
@@ -307,8 +301,8 @@ export class WaRetryReplayService {
             addressingMode: isStatus
                 ? undefined
                 : requesterAddress.server === WA_DEFAULTS.LID_SERVER
-                  ? 'lid'
-                  : 'pn',
+                  ? WA_ADDRESSING_MODES.LID
+                  : WA_ADDRESSING_MODES.PN,
             encType: encrypted.type,
             ciphertext: encrypted.ciphertext,
             retryCount,

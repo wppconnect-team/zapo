@@ -27,11 +27,14 @@ export {
     toProxyAgent,
     toProxyDispatcher
 } from '@transport/proxy'
-export { fetchLatestWaWebVersion } from '@transport/wa-web-version-fetcher'
+export { fetchLatestWaWebVersion, fetchLatestWaMobileVersion } from '@transport/wa-version-fetcher'
 export type {
+    WaFetchVersionOptions,
     WaFetchLatestWebVersionOptions,
-    WaLatestWebVersion
-} from '@transport/wa-web-version-fetcher'
+    WaFetchLatestMobileVersionOptions,
+    WaLatestWebVersion,
+    WaLatestMobileVersion
+} from '@transport/wa-version-fetcher'
 export { WaComms } from '@transport/WaComms'
 export { verifyNoiseCertificateChain, type WaNoiseRootCa } from '@transport/noise/WaNoiseCert'
 export { WaNoiseHandshake } from '@transport/noise/WaNoiseHandshake'
@@ -47,3 +50,13 @@ export type {
     WaMobileTransportDeviceInfo
 } from '@transport/noise/WaMobileClientPayload'
 export { assertIqResult, buildIqNode, parseIqError, queryWithContext } from '@transport/node/query'
+export { buildAckNode, buildReceiptNode } from '@transport/node/builders/global'
+export type { BuildAckNodeInput, BuildReceiptNodeInput } from '@transport/node/builders/global'
+export {
+    findNodeChild,
+    getFirstNodeChild,
+    getNodeChildren,
+    getNodeChildrenByTag,
+    getNodeTextContent,
+    hasNodeChild
+} from '@transport/node/helpers'

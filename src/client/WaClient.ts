@@ -10,15 +10,27 @@ import type { WaEmailCoordinator } from '@client/coordinators/WaEmailCoordinator
 import type { WaGroupCoordinator } from '@client/coordinators/WaGroupCoordinator'
 import type { WaLowLevelCoordinator } from '@client/coordinators/WaLowLevelCoordinator'
 import type { WaMessageCoordinator } from '@client/coordinators/WaMessageCoordinator'
+import type { WaMobileCoordinator } from '@client/coordinators/WaMobileCoordinator'
 import type { WaNewsletterCoordinator } from '@client/coordinators/WaNewsletterCoordinator'
 import type { WaPresenceCoordinator } from '@client/coordinators/WaPresenceCoordinator'
 import type { WaPrivacyCoordinator } from '@client/coordinators/WaPrivacyCoordinator'
 import type { WaProfileCoordinator } from '@client/coordinators/WaProfileCoordinator'
 import type { WaStatusCoordinator } from '@client/coordinators/WaStatusCoordinator'
 import { createIgnoreKeyFilter, validateIgnoreKey } from '@client/messaging/ignore-key'
+import {
+    createEphemeralObserver,
+    persistIncomingEphemeralSetting
+} from '@client/persistence/ephemeral-setting'
+import { runGroupHistoryBundle } from '@client/persistence/group-history'
 import { runHistorySyncNotification } from '@client/persistence/history-sync'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
+import { installWaClientPlugins, type WaClientPluginInstallInput } from '@client/plugins/install'
+import type {
+    WaClientExposedFromPlugins,
+    WaClientPluginDefinition,
+    WaClientPluginEventsFromPlugins
+} from '@client/plugins/types'
 import type {
     WaClientEventMap,
     WaClientOptions,
@@ -35,6 +47,7 @@ import {
 import { ConsoleLogger } from '@infra/log/ConsoleLogger'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
+import { unwrapMessage } from '@message/encode/content'
 import { proto, type Proto } from '@proto'
 import { WA_DEFAULTS, WA_MESSAGE_TYPES } from '@protocol/constants'
 import { normalizeDeviceJid } from '@protocol/jid'
@@ -42,7 +55,7 @@ import { WA_DISCONNECT_REASONS, WA_LOGOUT_REASONS, type WaLogoutReason } from '@
 import { buildRemoveCompanionDeviceIq } from '@transport/node/builders/device'
 import { assertIqResult, queryWithContext as queryNodeWithContext } from '@transport/node/query'
 import type { BinaryNode } from '@transport/types'
-import { fetchLatestWaWebVersion } from '@transport/wa-web-version-fetcher'
+import { fetchLatestWaMobileVersion, fetchLatestWaWebVersion } from '@transport/wa-version-fetcher'
 import { toError } from '@util/primitives'
 
 type WaIncomingProtocolType = NonNullable<Proto.Message.IProtocolMessage['type']>
@@ -53,55 +66,8 @@ const SYNC_RELATED_PROTOCOL_TYPES = new Set<WaIncomingProtocolType>([
     proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE
 ])
 
-/**
- * Top-level WhatsApp client. Owns the transport, auth, signal, and per-feature
- * coordinators (accessible via getters such as {@link message}, {@link group},
- * {@link newsletter}, etc.) and re-emits every {@link WaClientEventMap} event.
- *
- * Lifecycle: construct with {@link WaClientOptions}, call {@link connect} to
- * open the socket, react to `connection`/`auth_qr`/`auth_pairing_code` events,
- * then use the coordinator getters to drive the session. Call {@link disconnect}
- * to shut down cleanly or {@link logout} to remove the companion device.
- *
- * @example
- * ```ts
- * import { createPinoLogger, createStore, WaClient } from 'zapo-js'
- * import { createSqliteStore } from '@zapo-js/store-sqlite'
- *
- * const store = createStore({
- *     backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
- *     providers: {
- *         auth: 'sqlite',
- *         signal: 'sqlite',
- *         preKey: 'sqlite',
- *         session: 'sqlite',
- *         identity: 'sqlite',
- *         senderKey: 'sqlite',
- *         appState: 'sqlite',
- *         privacyToken: 'sqlite',
- *         messages: 'sqlite',
- *         threads: 'sqlite',
- *         contacts: 'sqlite'
- *     }
- * })
- *
- * const client = new WaClient(
- *     { store, sessionId: 'default' },
- *     await createPinoLogger({ level: 'info', pretty: true })
- * )
- *
- * client.on('auth_qr', ({ qr, ttlMs }) => console.log('scan:', qr, ttlMs))
- * client.on('connection', (event) => console.log('connection', event))
- * client.on('message', async (event) => {
- *     if (event.message?.conversation === 'ping') {
- *         await client.message.send(event.chatJid!, 'pong')
- *     }
- * })
- *
- * await client.connect()
- * ```
- */
-export class WaClient extends EventEmitter {
+/** @internal Implementation backing the exported {@link WaClient}. */
+class WaClientImpl extends EventEmitter {
     private readonly options!: Readonly<WaClientOptions>
     private readonly logger!: Logger
     private readonly stores!: ReturnType<WaClientOptions['store']['session']>
@@ -109,10 +75,13 @@ export class WaClient extends EventEmitter {
     private readonly appStateSync!: WaAppStateSyncClient
     private readonly mediaTransfer!: WaMediaTransferClient
     private readonly writeBehind!: WriteBehindPersistence
+    private readonly observeEphemeralSetting!: (event: WaIncomingMessageEvent) => void
     private connectPromise: Promise<void> | null = null
     private acceptingIncomingEvents = true
     private activeIncomingHandlers = 0
     private readonly incomingHandlersDrainedWaiters: Array<() => void> = []
+    private disposePlugins: (() => Promise<void>) | null = null
+    private readonly pluginInstallInput!: WaClientPluginInstallInput
 
     /**
      * @param options Client configuration (store, transport, addons, history...).
@@ -134,6 +103,10 @@ export class WaClient extends EventEmitter {
             this.logger,
             this.options.writeBehind
         )
+        this.observeEphemeralSetting = createEphemeralObserver({
+            logger: this.logger,
+            chatMetadataStore: this.stores.chatMetadata
+        })
 
         const dependencies = buildWaClientDependencies({
             base,
@@ -166,18 +139,43 @@ export class WaClient extends EventEmitter {
         this.appStateSync = dependencies.appStateSync
         this.mediaTransfer = dependencies.mediaTransfer
 
+        this.pluginInstallInput = {
+            options: this.options,
+            logger: this.logger,
+            stores: this.stores,
+            deps: this.deps,
+            queryWithContext: this.queryWithContext.bind(this)
+        }
+        this.installPlugins()
+
         this.bindNodeTransportEvents()
         this.on('connection', (event) => {
             if (event.status !== 'close') return
             if (!this.options.recoverFromClientTooOld) return
             if (event.reason !== WA_DISCONNECT_REASONS.FAILURE_CLIENT_TOO_OLD) return
             this.logger.warn(
-                'wa rejected the connect with client_too_old: the zapo default WA Web version is outdated. ' +
-                    'Auto-recovering by fetching the current version from web.whatsapp.com – ' +
+                'wa rejected the connect with client_too_old: the zapo default WA version is outdated. ' +
+                    'Auto-recovering by fetching the current version from the public source – ' +
                     'please upgrade zapo so the shipped default catches up.'
             )
             void this.runClientTooOldRecover()
         })
+        this.on('connection', (event) => {
+            if (event.status !== 'open') return
+            void this.deps.mobileCoordinator.reconcileCompanions().catch((error) => {
+                this.logger.debug('companion reconcile on connect failed', {
+                    message: toError(error).message
+                })
+            })
+        })
+    }
+
+    private installPlugins(): void {
+        this.disposePlugins = installWaClientPlugins(
+            this,
+            this.pluginInstallInput,
+            this.options.plugins ?? []
+        )
     }
 
     private async runClientTooOldRecover(): Promise<void> {
@@ -185,11 +183,19 @@ export class WaClient extends EventEmitter {
             if (this.connectPromise) {
                 await this.connectPromise.catch(() => undefined)
             }
-            const latest = await fetchLatestWaWebVersion()
+            const mobile = this.deps.isMobilePrimary()
+            const latest = mobile
+                ? await fetchLatestWaMobileVersion()
+                : await fetchLatestWaWebVersion()
             this.logger.info('client_too_old auto-recover: reconnecting', {
+                transport: mobile ? 'mobile' : 'web',
                 version: latest.version
             })
-            this.deps.authClient.setNextConnectVersion(latest.version)
+            if (mobile) {
+                this.deps.authClient.setNextConnectMobileAppVersion(latest.version)
+            } else {
+                this.deps.authClient.setNextConnectVersion(latest.version)
+            }
             await this.connect()
         } catch (error) {
             this.logger.warn('client_too_old auto-recover failed', {
@@ -280,6 +286,7 @@ export class WaClient extends EventEmitter {
         }
         try {
             this.emit('message', event)
+            this.observeEphemeralSetting(event)
             void persistIncomingMailboxEntities({
                 logger: this.logger,
                 writeBehind: this.writeBehind,
@@ -304,6 +311,9 @@ export class WaClient extends EventEmitter {
                         message: toError(err).message
                     })
                 })
+            }
+            if (this.options.history?.groupBundles === true && event.message && !event.key.fromMe) {
+                this.tryProcessGroupHistoryBundle(event)
             }
             const protocolMessage = event.message?.protocolMessage
             if (!protocolMessage) {
@@ -362,6 +372,7 @@ export class WaClient extends EventEmitter {
                         {
                             logger: this.logger,
                             mediaTransfer: this.mediaTransfer,
+                            chatMetadataStore: this.stores.chatMetadata,
                             writeBehind: this.writeBehind,
                             emitEvent: this.emit.bind(this),
                             onPrivacyTokens: (conversations) =>
@@ -375,6 +386,17 @@ export class WaClient extends EventEmitter {
                 } else if (sendHistSyncReceipt) {
                     await sendHistSyncReceipt()
                 }
+                return
+            }
+
+            if (protocolType === proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING) {
+                persistIncomingEphemeralSetting({
+                    logger: this.logger,
+                    writeBehind: this.writeBehind,
+                    chatMetadataStore: this.stores.chatMetadata,
+                    event,
+                    protocolMessage
+                })
                 return
             }
 
@@ -395,6 +417,47 @@ export class WaClient extends EventEmitter {
         } finally {
             this.leaveIncomingHandler()
         }
+    }
+
+    /**
+     * Kicks off the group-history bundle download when the incoming message
+     * carries one. Fire-and-forget: the blob can be large, and the incoming
+     * handler must not stall behind a CDN fetch.
+     *
+     * The download outlives the handler that started it, so it takes a slot of
+     * its own in the drain accounting - `disconnect()` and `clearStoredState()`
+     * must not flush or wipe the stores while a bundle is still writing.
+     */
+    private tryProcessGroupHistoryBundle(event: WaIncomingMessageEvent): void {
+        const bundle = unwrapMessage(event.message ?? {}).messageHistoryBundle
+        const groupJid = event.key.remoteJid
+        if (!bundle || !groupJid) {
+            return
+        }
+        if (!this.tryEnterIncomingHandler()) {
+            return
+        }
+        const credentials = this.deps.authClient.getCurrentCredentials()
+        void runGroupHistoryBundle(
+            {
+                logger: this.logger,
+                mediaTransfer: this.mediaTransfer,
+                writeBehind: this.writeBehind,
+                emitEvent: this.emit.bind(this),
+                meJid: credentials?.meJid,
+                meLid: credentials?.meLid,
+                getAbPropNumber: (name) => this.deps.abPropsCoordinator.getConfigValue<number>(name)
+            },
+            {
+                bundle,
+                groupJid,
+                senderJid: event.key.participant ?? undefined,
+                bundleMessageId: event.key.id,
+                sentAtSeconds: event.timestampSeconds
+            }
+        ).finally(() => {
+            this.leaveIncomingHandler()
+        })
     }
 
     private async queryWithContext(
@@ -455,6 +518,10 @@ export class WaClient extends EventEmitter {
             return this.connectPromise
         }
 
+        if (!this.disposePlugins) {
+            this.installPlugins()
+        }
+
         this.writeBehind.restart()
 
         this.acceptingIncomingEvents = true
@@ -480,13 +547,15 @@ export class WaClient extends EventEmitter {
 
     /**
      * Closes the transport gracefully: pauses incoming events, flushes the
-     * write-behind persistence queue, and emits a `connection` close event
-     * with reason `client_disconnected`. Does not clear stored credentials -
-     * call {@link connect} again to resume the same session. There is no
-     * built-in auto-reconnect; subscribe to `connection: { status: 'close' }`
-     * and decide your own backoff.
+     * write-behind persistence queue, disposes installed plugins, and emits a
+     * `connection` close event with reason `client_disconnected`. Does not
+     * clear stored credentials - call {@link connect} again to resume the same
+     * session, which reinstalls the plugins. There is no built-in
+     * auto-reconnect; subscribe to `connection: { status: 'close' }` and decide
+     * your own backoff.
      */
     public async disconnect(): Promise<void> {
+        this.deps.privacyCoordinator.stopAccountSyncRefresh()
         await this.pauseIncomingEventsAndWaitDrain()
         const writeBehindFlush = await this.writeBehind.flush(
             this.options.writeBehind?.flushTimeoutMs
@@ -495,6 +564,11 @@ export class WaClient extends EventEmitter {
             this.logger.warn('disconnect continuing with pending write-behind entries', {
                 remaining: writeBehindFlush.remaining
             })
+        }
+        if (this.disposePlugins) {
+            const dispose = this.disposePlugins
+            this.disposePlugins = null
+            await dispose()
         }
         await this.deps.connectionManager.disconnect()
         this.emit('connection', {
@@ -538,7 +612,7 @@ export class WaClient extends EventEmitter {
     public get auth(): WaAuthClient {
         return this.deps.authClient
     }
-    /** Message coordinator: send/receive, receipts, addons, media download. */
+    /** Message coordinator: send/receive, receipts, addons, media upload/download. */
     public get message(): WaMessageCoordinator {
         return this.deps.messageCoordinator
     }
@@ -602,6 +676,14 @@ export class WaClient extends EventEmitter {
      */
     public get email(): WaEmailCoordinator {
         return this.deps.emailCoordinator
+    }
+    /**
+     * Mobile coordinator: host and manage companion devices linked to this
+     * mobile-primary account (link via QR or pairing code, list, revoke).
+     * Requires a registered primary session. See {@link WaMobileCoordinator}.
+     */
+    public get mobile(): WaMobileCoordinator {
+        return this.deps.mobileCoordinator
     }
 
     /**
@@ -721,3 +803,100 @@ export class WaClient extends EventEmitter {
         this.emit('debug_client_error', { error })
     }
 }
+
+/**
+ * A WhatsApp client instance: per-feature coordinator getters ({@link message},
+ * {@link group}, {@link newsletter}, ...) plus typed `on`/`once`/`off`/`emit`.
+ *
+ * `TPluginEvents` carries the events of the plugins installed on this client.
+ * Prefer deriving the precise type from the construction site (e.g.
+ * `type AppClient = ReturnType<typeof createClient>`) over the bare `WaClient`,
+ * which only knows the core events and no plugin getters.
+ */
+export interface WaClient<TPluginEvents = {}> extends WaClientImpl {
+    on<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    once<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    off<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    emit<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        payload: Parameters<
+            Extract<(WaClientEventMap & TPluginEvents)[K], (...args: never[]) => unknown>
+        >[0]
+    ): boolean
+}
+
+/**
+ * Constructor surface for {@link WaClient}. `new WaClient({ plugins })` infers the
+ * exposed plugin getters (e.g. `client.voip`) from the plugin values passed:
+ * no global type augmentation, so a getter exists only when its plugin is installed.
+ */
+export interface WaClientConstructor {
+    new <const P extends readonly WaClientPluginDefinition[] = []>(
+        options: Omit<WaClientOptions, 'plugins'> & { readonly plugins?: P },
+        logger?: Logger
+    ): WaClient<WaClientPluginEventsFromPlugins<P>> & WaClientExposedFromPlugins<P>
+}
+
+/**
+ * Top-level WhatsApp client. Owns the transport, auth, signal, and per-feature
+ * coordinators (accessible via getters such as {@link message}, {@link group},
+ * {@link newsletter}, etc.) and re-emits every {@link WaClientEventMap} event.
+ *
+ * Lifecycle: construct with {@link WaClientOptions}, call {@link connect} to
+ * open the socket, react to `connection`/`auth_qr`/`auth_pairing_code` events,
+ * then use the coordinator getters to drive the session. Call {@link disconnect}
+ * to shut down cleanly or {@link logout} to remove the companion device.
+ *
+ * Pass `plugins` to expose plugin getters and events on the returned client,
+ * typed from the values you pass: e.g. `plugins: [voipPlugin()]` adds
+ * `client.voip` and the `voip_*` events, and only then. See
+ * {@link WaClientConstructor}.
+ *
+ * @example
+ * ```ts
+ * import { createPinoLogger, createStore, WaClient } from 'zapo-js'
+ * import { createSqliteStore } from '@zapo-js/store-sqlite'
+ *
+ * const store = createStore({
+ *     backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
+ *     providers: {
+ *         auth: 'sqlite',
+ *         signal: 'sqlite',
+ *         preKey: 'sqlite',
+ *         session: 'sqlite',
+ *         identity: 'sqlite',
+ *         senderKey: 'sqlite',
+ *         appState: 'sqlite',
+ *         privacyToken: 'sqlite',
+ *         messages: 'sqlite',
+ *         threads: 'sqlite',
+ *         contacts: 'sqlite'
+ *     }
+ * })
+ *
+ * const client = new WaClient(
+ *     { store, sessionId: 'default' },
+ *     await createPinoLogger({ level: 'info', pretty: true })
+ * )
+ *
+ * client.on('auth_qr', ({ qr, ttlMs }) => console.log('scan:', qr, ttlMs))
+ * client.on('connection', (event) => console.log('connection', event))
+ * client.on('message', async (event) => {
+ *     if (event.message?.conversation === 'ping') {
+ *         await client.message.send(event.chatJid!, 'pong')
+ *     }
+ * })
+ *
+ * await client.connect()
+ * ```
+ */
+export const WaClient = WaClientImpl as unknown as WaClientConstructor

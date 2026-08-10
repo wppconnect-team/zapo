@@ -8,6 +8,8 @@ module.exports = [
         ignores: [
             'dist/**',
             'packages/*/dist/**',
+            'packages/*/binding.js',
+            'packages/*/binding.d.ts',
             'wa-web/**',
             'wa-mob/**',
             'coverage/**',
@@ -16,6 +18,7 @@ module.exports = [
             'spec/proto/*.tmp.*',
             'spec/proto/WAProto.codegen.tmp.proto',
             'spec/proto/WAProto.types.codegen.tmp.js',
+            'spec/abprops/**',
             'spec/mex/**',
             'spec/appstate/**',
             'spec/version/**'
@@ -51,8 +54,10 @@ module.exports = [
                     './packages/store-redis/tsconfig.json',
                     './packages/store-mongo/tsconfig.json',
                     './packages/media-utils/tsconfig.json',
+                    './packages/voip/tsconfig.json',
                     './packages/fake-server/tsconfig.json',
-                    './packages/mcp-server/tsconfig.json'
+                    './packages/mcp-server/tsconfig.json',
+                    './packages/wam/tsconfig.json'
                 ]
             }
         }
@@ -68,6 +73,7 @@ module.exports = [
             'import/parsers': {
                 '@typescript-eslint/parser': ['.ts', '.tsx']
             },
+            'import/internal-regex': '^@zapo-js/',
             'import/resolver': {
                 node: {
                     extensions: ['.ts', '.tsx', '.js', '.mjs', '.cjs']
@@ -85,6 +91,7 @@ module.exports = [
                         './packages/store-redis/tsconfig.json',
                         './packages/store-mongo/tsconfig.json',
                         './packages/media-utils/tsconfig.json',
+                        './packages/voip/tsconfig.json',
                         './packages/fake-server/tsconfig.json',
                         './packages/mcp-server/tsconfig.json'
                     ]
@@ -150,6 +157,7 @@ module.exports = [
         files: [
             'src/proto.ts',
             'src/mex.ts',
+            'src/abprops-spec.ts',
             'src/appstate-spec.ts',
             'src/version-spec.ts',
             'src/__tests__/index.test.ts'
