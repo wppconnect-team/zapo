@@ -1,5 +1,4 @@
-import sharp from 'sharp'
-import type { Sharp } from 'sharp'
+import sharp, { type Sharp } from 'sharp'
 import type {
     WaMediaProcessorImageResult,
     WaMediaProcessorInput,
