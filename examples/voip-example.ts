@@ -35,9 +35,10 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
+import { createPinoLogger, createStore, type LogLevel, WaClient } from 'zapo-js'
+
 import { createSqliteStore } from '@zapo-js/store-sqlite'
 import { CallState, EndCallReason, voipPlugin } from '@zapo-js/voip'
-import { createPinoLogger, createStore, type LogLevel, WaClient } from 'zapo-js'
 
 const SAMPLE_RATE = 16_000
 // Cap an in-memory recording at ~10 minutes so a long call cannot grow unbounded.
