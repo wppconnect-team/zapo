@@ -1,6 +1,6 @@
 const { xeddsaSign, xeddsaVerify } = require('../binding.js')
 const assert = require('node:assert')
-const { randomBytes, createHash } = require('node:crypto')
+const { randomBytes } = require('node:crypto')
 
 if (typeof xeddsaSign !== 'function' || typeof xeddsaVerify !== 'function') {
     console.error('native binding NOT loaded')
