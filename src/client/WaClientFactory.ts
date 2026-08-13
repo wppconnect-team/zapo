@@ -75,6 +75,7 @@ import {
 import type {
     WaClientEventMap,
     WaClientOptions,
+    WaIncomingDecryptedPayloadEvent,
     WaIncomingMessageEvent,
     WaIncomingProtocolMessageEvent,
     WaIncomingUnhandledStanzaEvent,
@@ -86,6 +87,10 @@ import type { WaMediaConn } from '@media/types'
 import { createDefaultLinkPreviewFetcher } from '@message/addons/link-preview/fetcher'
 import { processNewsletterLiveUpdates } from '@message/kinds/newsletter'
 import { handleIncomingMessageAck } from '@message/primitives/incoming'
+import {
+    createMediaRetryRequester,
+    type WaMediaRetryRequester
+} from '@message/primitives/media-retry'
 import {
     createPeerDataOperationRequester,
     type PeerDataOperationRequester
@@ -161,6 +166,8 @@ interface WaClientBuildRuntime {
         event: K,
         ...args: Parameters<WaClientEventMap[K]>
     ) => void
+    /** Whether anything is subscribed, for events whose payload costs something to build. */
+    readonly hasEventListener: (event: keyof WaClientEventMap) => boolean
     readonly handleIncomingMessageEvent: (event: WaIncomingMessageEvent) => Promise<void>
     readonly handleError: (error: Error) => void
     readonly handleIncomingFrame: (frame: Uint8Array) => Promise<void>
@@ -309,6 +316,7 @@ function createIncomingNodeRuntime(input: {
     readonly streamControl: WaStreamControlHandler
     readonly mediaMessageBuildOptions: WaMediaMessageOptions
     readonly retryCoordinator: WaRetryCoordinator
+    readonly mediaRetryRequester: WaMediaRetryRequester
     readonly messageDispatch: WaMessageDispatchCoordinator
     readonly sendNode: (node: BinaryNode) => Promise<void>
     readonly syncAppState: () => Promise<void>
@@ -333,6 +341,7 @@ function createIncomingNodeRuntime(input: {
         streamControl,
         mediaMessageBuildOptions,
         retryCoordinator,
+        mediaRetryRequester,
         messageDispatch,
         sendNode,
         syncAppState,
@@ -366,6 +375,7 @@ function createIncomingNodeRuntime(input: {
             handleIncomingMessageAck(node, incomingMessageAckOptions),
         sendNode,
         handleIncomingRetryReceipt: (node) => retryCoordinator.handleIncomingRetryReceipt(node),
+        handleMediaRetryNotification: (node) => mediaRetryRequester.handleNotification(node),
         trackOutboundReceipt: (node) => retryCoordinator.trackOutboundReceipt(node),
         emitIncomingReceipt: (event) => emitEvent('receipt', event),
         emitIncomingPresence: (event) => emitEvent('presence', event),
@@ -816,9 +826,16 @@ export function buildWaClientDependencies(input: {
         subscribeToProtocolMessage: runtime.subscribeProtocolMessage
     })
 
+    const mediaRetryRequester = createMediaRetryRequester({
+        logger,
+        sendNode: (node) => nodeOrchestrator.sendNode(node, false),
+        getCurrentCredentials
+    })
+
     const messageCoordinator = new WaMessageCoordinator({
         messageDispatch,
         mediaTransfer,
+        mediaRetry: mediaRetryRequester,
         mediaUploadOptions: mediaMessageBuildOptions,
         logger,
         messageStore: sessionStore.messages,
@@ -1052,7 +1069,15 @@ export function buildWaClientDependencies(input: {
             runtime.emitEvent('newsletter_message_update', event),
         emitUnavailableMessage: (event) => runtime.emitEvent('message_unavailable', event),
         emitUnhandledStanza: (event: WaIncomingUnhandledStanzaEvent) =>
-            runtime.emitEvent('debug_unhandled_stanza', event)
+            runtime.emitEvent('debug_unhandled_stanza', event),
+        emitDecryptedPayload: (build: () => WaIncomingDecryptedPayloadEvent) => {
+            // Built only if someone is subscribed: the payload carries a copy of
+            // the plaintext and a redacted node, and this runs per `<enc>`.
+            if (!runtime.hasEventListener('debug_decrypted_payload')) {
+                return
+            }
+            runtime.emitEvent('debug_decrypted_payload', build())
+        }
     }
 
     const handleClientDirtyBits = (dirtyBits: Parameters<typeof handleDirtyBits>[1]) =>
@@ -1092,6 +1117,7 @@ export function buildWaClientDependencies(input: {
             streamControl,
             mediaMessageBuildOptions,
             retryCoordinator,
+            mediaRetryRequester,
             messageDispatch,
             sendNode: runtime.sendNode,
             syncAppState: runtime.syncAppState,
