@@ -1,5 +1,6 @@
 import type { Proto } from '@proto'
 import { isGroupOrBroadcastJid, toUserJid } from '@protocol/jid'
+import { longToNumber } from '@util/primitives'
 
 export interface WaSendContextInfo {
     readonly quotedMessageId?: string
@@ -14,6 +15,9 @@ export interface WaSendContextInfo {
 
     readonly isSpoiler?: boolean
     readonly expirationSeconds?: number
+    readonly ephemeralSettingTimestamp?: number
+    readonly disappearingModeInitiator?: Proto.DisappearingMode.Initiator
+    readonly disappearingModeTrigger?: Proto.DisappearingMode.Trigger
 
     readonly groupSubject?: string
     readonly parentGroupJid?: string
@@ -45,6 +49,22 @@ export function buildContextInfoProto(input: WaSendContextInfo): Proto.IContextI
 
     if (input.isSpoiler !== undefined) ctx.isSpoiler = input.isSpoiler
     if (input.expirationSeconds !== undefined) ctx.expiration = input.expirationSeconds
+    if (input.ephemeralSettingTimestamp !== undefined) {
+        ctx.ephemeralSettingTimestamp = input.ephemeralSettingTimestamp
+    }
+    if (
+        input.disappearingModeInitiator !== undefined ||
+        input.disappearingModeTrigger !== undefined
+    ) {
+        ctx.disappearingMode = {
+            ...(input.disappearingModeInitiator !== undefined
+                ? { initiator: input.disappearingModeInitiator }
+                : {}),
+            ...(input.disappearingModeTrigger !== undefined
+                ? { trigger: input.disappearingModeTrigger }
+                : {})
+        }
+    }
 
     if (input.groupSubject !== undefined) ctx.groupSubject = input.groupSubject
     if (input.parentGroupJid !== undefined) ctx.parentGroupJid = input.parentGroupJid
@@ -114,6 +134,34 @@ export function pickIncomingExpirationSeconds(
     return undefined
 }
 
+/**
+ * Reads `contextInfo.ephemeralSettingTimestamp` (Unix seconds) from the first
+ * submessage that carries it. Peers stamp it on every message in a disappearing
+ * chat, which makes it the only continuously-refreshed source for the setting -
+ * history sync and `EPHEMERAL_SETTING` are point-in-time.
+ */
+export function pickIncomingEphemeralSettingTimestamp(
+    message: Proto.IMessage | undefined
+): number | undefined {
+    if (!message) return undefined
+    const inner = message.ephemeralMessage?.message ?? message
+    for (const key of Object.keys(inner)) {
+        const value = (inner as Record<string, unknown>)[key]
+        if (
+            value &&
+            typeof value === 'object' &&
+            !Array.isArray(value) &&
+            !(value instanceof Uint8Array)
+        ) {
+            const stamp = (value as ContextInfoCarrier).contextInfo?.ephemeralSettingTimestamp
+            if (stamp !== undefined && stamp !== null) {
+                return longToNumber(stamp)
+            }
+        }
+    }
+    return undefined
+}
+
 function pickContextInfoTarget(message: Proto.IMessage): ContextInfoCarrier | null {
     for (const key of Object.keys(message)) {
         const value = (message as Record<string, unknown>)[key]
@@ -127,6 +175,11 @@ function pickContextInfoTarget(message: Proto.IMessage): ContextInfoCarrier | nu
         }
     }
     return null
+}
+
+/** Reads the `contextInfo` off a message's first content submessage (null when absent). */
+export function getContextInfo(message: Proto.IMessage): Proto.IContextInfo | null {
+    return pickContextInfoTarget(message)?.contextInfo ?? null
 }
 
 /**

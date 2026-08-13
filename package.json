@@ -1,6 +1,6 @@
 {
     "name": "@wppconnect/zapo",
-    "version": "1.2.0",
+    "version": "1.7.1",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
@@ -10,7 +10,7 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/vinikjkkj/zapo.git"
+        "url": "git+https://github.com/wppconnect-team/zapo.git"
     },
     "packageManager": "npm@10.0.0",
     "main": "dist/index.js",
@@ -105,6 +105,8 @@
     },
     "files": [
         "dist",
+        "spec/abprops/index.js",
+        "spec/abprops/index.d.ts",
         "spec/proto/index.js",
         "spec/proto/index.d.ts",
         "spec/mex/index.js",
@@ -212,15 +214,10 @@
         "flatted": "^3.4.2",
         "picomatch@<2.3.2": "2.3.2",
         "picomatch@4": "^4.0.4",
-        "brace-expansion@1": "1.1.13",
+        "brace-expansion@1": "1.1.18",
         "brace-expansion@2": "^2.0.3",
-        "brace-expansion@4": "^4.0.2",
-        "brace-expansion@5": "^5.0.6"
-        "ws": "^8.18.3"
-    },
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/wppconnect-team/zapo.git"
+        "brace-expansion@4": "5.0.9",
+        "brace-expansion@5": "^5.0.9"
     },
     "publishConfig": {
         "access": "public"

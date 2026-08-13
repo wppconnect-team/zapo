@@ -6,6 +6,25 @@ export const WA_MESSAGE_TAGS = Object.freeze({
     ERROR: 'error'
 } as const)
 
+/** `<enc type>` ciphertext kinds (Signal `msg`/`pkmsg`, group `skmsg`, message-secret `msmsg`). */
+export const WA_ENC_CIPHERTEXT_TYPES = Object.freeze({
+    MESSAGE: 'msg',
+    PREKEY: 'pkmsg',
+    SENDER_KEY: 'skmsg',
+    MESSAGE_SECRET: 'msmsg'
+} as const)
+
+export type WaEncCiphertextType =
+    (typeof WA_ENC_CIPHERTEXT_TYPES)[keyof typeof WA_ENC_CIPHERTEXT_TYPES]
+
+/** `addressing_mode` stanza attr: phone-number vs LID addressing. */
+export const WA_ADDRESSING_MODES = Object.freeze({
+    PN: 'pn',
+    LID: 'lid'
+} as const)
+
+export type WaAddressingMode = (typeof WA_ADDRESSING_MODES)[keyof typeof WA_ADDRESSING_MODES]
+
 export const WA_MESSAGE_TYPES = Object.freeze({
     ENC_VERSION: '2',
     MEDIA_NOTIFY: 'medianotify',
@@ -116,3 +135,12 @@ export const WA_ENC_MEDIA_TYPES = Object.freeze({
     NATIVE_FLOW_RESPONSE: 'native_flow_response',
     GROUP_HISTORY: 'group_history'
 } as const)
+
+/**
+ * `ephemeralSettingTimestamp` to Unix seconds. `ContextInfo` uses seconds, the
+ * history-sync `Conversation` record milliseconds, and both feed one stored
+ * field. Anything past ~year 2286 in seconds can only be a millisecond stamp.
+ */
+export function normalizeEphemeralSettingSeconds(value: number): number {
+    return value > 10_000_000_000 ? Math.floor(value / 1000) : value
+}

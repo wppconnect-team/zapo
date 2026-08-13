@@ -385,9 +385,7 @@ export class WaAppStateSyncClient {
         try {
             return await inFlight
         } finally {
-            if (this.syncPromise === inFlight) {
-                this.syncPromise = null
-            }
+            this.syncPromise = null
         }
     }
 

@@ -1,4 +1,4 @@
-import sharp from 'sharp'
+import sharp, { type Sharp } from 'sharp'
 import type {
     WaMediaProcessorImageResult,
     WaMediaProcessorInput,
@@ -7,7 +7,7 @@ import type {
 
 const DEFAULT_THUMB_QUALITY = 70
 
-function createPipeline(input: WaMediaProcessorInput): sharp.Sharp {
+function createPipeline(input: WaMediaProcessorInput): Sharp {
     if (input instanceof Uint8Array || typeof input === 'string') return sharp(input)
     const pipeline = sharp()
     ;(input as NodeJS.ReadableStream).pipe(pipeline)

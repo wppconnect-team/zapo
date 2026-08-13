@@ -183,7 +183,7 @@ function decodeCompactRetryReplayPayload(raw: Uint8Array): WaRetryReplayPayload 
     if (mode === RETRY_PAYLOAD_MODE.plaintext) {
         let to = ''
         let type = ''
-        let plaintext = raw
+        let plaintext: Uint8Array
         ;[to, offset] = readString(raw, offset, 'to')
         ;[type, offset] = readString(raw, offset, 'type')
         ;[plaintext, offset] = readBytes(raw, offset, 'plaintext')
@@ -201,7 +201,7 @@ function decodeCompactRetryReplayPayload(raw: Uint8Array): WaRetryReplayPayload 
         let encTypeCode = 0
         let hasParticipant = 0
         let participant: string | undefined
-        let ciphertext = raw
+        let ciphertext: Uint8Array
         ;[to, offset] = readString(raw, offset, 'to')
         ;[type, offset] = readString(raw, offset, 'type')
         ;[encTypeCode, offset] = readUint8(raw, offset, 'encType')
@@ -224,7 +224,7 @@ function decodeCompactRetryReplayPayload(raw: Uint8Array): WaRetryReplayPayload 
         }
     }
     if (mode === RETRY_PAYLOAD_MODE.opaque_node) {
-        let node = raw
+        let node: Uint8Array
         ;[node, offset] = readBytes(raw, offset, 'node')
         assertNoTrailingData(raw, offset)
         return {

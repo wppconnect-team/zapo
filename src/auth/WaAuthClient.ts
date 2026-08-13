@@ -5,6 +5,7 @@ import {
 } from '@auth/credentials-flow'
 import { WaPairingFlow } from '@auth/pairing/WaPairingFlow'
 import { WaQrFlow } from '@auth/pairing/WaQrFlow'
+import { type WaShortcakeAssertionSigner, WaShortcakeFlow } from '@auth/pairing/WaShortcakeFlow'
 import type {
     WaAuthClientOptions,
     WaAuthCredentials,
@@ -12,15 +13,16 @@ import type {
     WaSuccessPersistAttributes
 } from '@auth/types'
 import type { Logger } from '@infra/log/types'
-import { getWaCompanionPlatformId, WA_DEFAULTS } from '@protocol/constants'
+import { resolveWaDeviceIdentity, WA_NOTIFICATION_TYPES } from '@protocol/constants'
 import type { WaAuthStore } from '@store/contracts/auth.store'
 import type { WaPreKeyStore } from '@store/contracts/pre-key.store'
 import type { WaSignalStore } from '@store/contracts/signal.store'
+import { buildAckNode } from '@transport/node/builders/global'
+import { resolveDevicePropsPlatformType } from '@transport/noise/WaClientPayload'
 import type { WaNoiseRootCa } from '@transport/noise/WaNoiseCert'
 import type { BinaryNode, WaCommsConfig } from '@transport/types'
 import { uint8Equal } from '@util/bytes'
 import { toError } from '@util/primitives'
-import { getRuntimeOsDisplayName } from '@util/runtime'
 
 type WaAuthClientDeps = Readonly<{
     readonly logger: Logger
@@ -38,6 +40,10 @@ type WaAuthClientDeps = Readonly<{
         readonly onPairingRefresh?: (forceManual: boolean) => void
         readonly onPaired?: (credentials: WaAuthCredentials) => void
         readonly onError?: (error: Error) => void
+        /** Server forced a passkey (Shortcake) prologue; `hasSigner` = a signer is configured. */
+        readonly onPasskeyRequired?: (hasSigner: boolean) => void
+        /** External WebAuthn signer – enables handling forced passkey (Shortcake) prologues. */
+        readonly signPasskeyAssertion?: WaShortcakeAssertionSigner
     }
 }>
 
@@ -60,20 +66,25 @@ export class WaAuthClient {
     private readonly isConnected?: () => boolean
     private readonly qrFlow: WaQrFlow
     private readonly pairingFlow: WaPairingFlow
+    private readonly socket: WaAuthClientDeps['socket']
+    private readonly shortcakeFlow: WaShortcakeFlow | null
     private credentials: WaAuthCredentials | null
     private versionOverride: string | null = null
+    private mobileAppVersionOverride: string | null = null
+    /**
+     * Successful logins made by this instance, advertised as
+     * `connectAttemptCount`. Process-local by design – the persisted
+     * counterpart is `credentials.loginCounter`.
+     */
+    private connectAttemptCount = 0
 
     public constructor(options: WaAuthClientOptions, deps: WaAuthClientDeps) {
-        const deviceBrowser = options.deviceBrowser ?? WA_DEFAULTS.DEVICE_BROWSER
-        const device = Object.freeze({
-            browser: deviceBrowser,
-            osDisplayName: options.deviceOsDisplayName ?? getRuntimeOsDisplayName(),
-            platform: options.devicePlatform ?? getWaCompanionPlatformId(deviceBrowser)
-        })
+        const device = resolveWaDeviceIdentity(options)
         this.options = Object.freeze({
             ...options,
             deviceBrowser: device.browser,
             deviceOsDisplayName: device.osDisplayName,
+            deviceOsVersion: device.osVersion ?? undefined,
             devicePlatform: device.platform,
             requireFullSync: options.requireFullSync
         })
@@ -107,6 +118,24 @@ export class WaAuthClient {
             },
             dangerous: options.dangerous
         })
+
+        this.socket = deps.socket
+        const signAssertion = deps.callbacks?.signPasskeyAssertion
+        this.shortcakeFlow = signAssertion
+            ? new WaShortcakeFlow({
+                  logger: this.logger,
+                  socket: {
+                      sendNode: deps.socket.sendNode,
+                      query: (node, timeoutMs) => deps.socket.query(node, timeoutMs)
+                  },
+                  signAssertion,
+                  auth: {
+                      getCredentials: () => this.credentials,
+                      updateCredentials: this.updateCredentials.bind(this)
+                  },
+                  deviceType: resolveDevicePropsPlatformType(device.browser)
+              })
+            : null
     }
 
     /**
@@ -164,12 +193,17 @@ export class WaAuthClient {
         this.logger.trace('auth client building comms config')
         const override = this.versionOverride
         this.versionOverride = null
+        const mobileAppVersionOverride = this.mobileAppVersionOverride
+        this.mobileAppVersionOverride = null
         return buildCommsConfig(this.logger, this.requireCredentials(), socketOptions, {
+            connectAttemptCount: this.connectAttemptCount,
             deviceBrowser: this.options.deviceBrowser,
             deviceOsDisplayName: this.options.deviceOsDisplayName,
+            deviceOsVersion: this.options.deviceOsVersion,
             requireFullSync: this.options.requireFullSync,
             version: override ?? this.options.version,
             mobileTransport: this.options.mobileTransport,
+            mobileAppVersionOverride: mobileAppVersionOverride ?? undefined,
             noiseTrustedRootCa: overrides.noiseTrustedRootCa,
             disableNoiseCertificateChainVerification:
                 overrides.disableNoiseCertificateChainVerification ??
@@ -188,12 +222,25 @@ export class WaAuthClient {
         this.versionOverride = version
     }
 
+    /**
+     * One-shot override for the mobile `deviceInfo.appVersion` on the next
+     * {@link buildCommsConfig} call, then clears. The mobile transport reads
+     * its version from `deviceInfo.appVersion` (the login payload), not the
+     * `version` string, so {@link setNextConnectVersion} has no effect on a
+     * mobile session. Used by the `recoverFromClientTooOld` auto-retry to
+     * inject a fresh Android app version without mutating the user's options.
+     */
+    public setNextConnectMobileAppVersion(appVersion: string): void {
+        this.mobileAppVersionOverride = appVersion
+    }
+
     /** Clears the in-memory QR and pairing sessions without touching storage. */
     // eslint-disable-next-line @typescript-eslint/require-await
     public async clearTransientState(): Promise<void> {
         this.logger.trace('auth client clear transient state')
         this.qrFlow.clear()
         this.pairingFlow.clearSession()
+        this.shortcakeFlow?.clearSession()
     }
 
     /**
@@ -284,10 +331,22 @@ export class WaAuthClient {
      * Persists the per-connection success attributes from the server (LID,
      * display name, companion key, last-success ts, props versions, ...). Only
      * persists when at least one attribute actually changed.
+     *
+     * Pass `countsAsLogin` only for the server `success` node: it advances the
+     * login counters advertised as `lc` / `connectAttemptCount`. Callers that
+     * merely reuse this to persist a single attribute (a push-name change, for
+     * instance) must leave it unset.
      */
-    public async persistSuccessAttributes(attributes: WaSuccessPersistAttributes): Promise<void> {
+    public async persistSuccessAttributes(
+        attributes: WaSuccessPersistAttributes,
+        { countsAsLogin = false }: { readonly countsAsLogin?: boolean } = {}
+    ): Promise<void> {
+        if (countsAsLogin) {
+            this.connectAttemptCount += 1
+        }
         let persistDiff: Record<string, boolean> | undefined
         const computeDiff = (current: WaAuthCredentials, next: WaAuthCredentials) => ({
+            loginCounterChanged: next.loginCounter !== current.loginCounter,
             lidChanged: next.meLid !== current.meLid,
             displayNameChanged: next.meDisplayName !== current.meDisplayName,
             companionChanged:
@@ -309,6 +368,9 @@ export class WaAuthClient {
                 meDisplayName: attributes.meDisplayName ?? credentials.meDisplayName,
                 companionEncStatic: attributes.companionEncStatic ?? credentials.companionEncStatic,
                 lastSuccessTs: attributes.lastSuccessTs ?? credentials.lastSuccessTs,
+                loginCounter: countsAsLogin
+                    ? (credentials.loginCounter ?? 0) + 1
+                    : credentials.loginCounter,
                 propsVersion: attributes.propsVersion ?? credentials.propsVersion,
                 abPropsVersion: attributes.abPropsVersion ?? credentials.abPropsVersion,
                 connectionLocation: attributes.connectionLocation ?? credentials.connectionLocation,
@@ -381,8 +443,40 @@ export class WaAuthClient {
 
     /** Dispatcher: returns `true` when `node` is a link-code companion notification. */
     public async handleLinkCodeNotification(node: BinaryNode): Promise<boolean> {
+        const type = node.attrs.type
+        if (
+            type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST ||
+            type === WA_NOTIFICATION_TYPES.CRSC_CONTINUATION
+        ) {
+            return this.runHandled(() => this.handleShortcakeNotification(node))
+        }
         this.logger.trace('auth client handleLinkCodeNotification', { id: node.attrs.id })
         return this.runHandled(() => this.pairingFlow.handleLinkCodeNotification(node))
+    }
+
+    /**
+     * Handles the server-forced passkey (Shortcake) prologue. With a configured
+     * `signPasskeyAssertion` the full handshake runs; without one we just ack
+     * and warn instead of silently stalling – which is what happens today when
+     * the server demands a passkey after a successful pairing-code
+     * `companion_finish`.
+     */
+    private async handleShortcakeNotification(node: BinaryNode): Promise<boolean> {
+        if (node.attrs.type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST) {
+            this.callbacks.onPasskeyRequired?.(this.shortcakeFlow !== null)
+        }
+        if (this.shortcakeFlow) {
+            return this.shortcakeFlow.handleIncomingNotification(node)
+        }
+        if (node.attrs.type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST) {
+            this.logger.warn(
+                'auth client: server requested passkey prologue but no signPasskeyAssertion configured',
+                { id: node.attrs.id }
+            )
+            await this.socket.sendNode(buildAckNode({ kind: 'notification', node }))
+            return true
+        }
+        return false
     }
 
     /** Dispatcher: returns `true` when `node` is a companion-registration refresh notification. */

@@ -477,9 +477,6 @@ export async function openSqliteConnection(
         SQLITE_CONNECTION_CACHE.set(cacheKey, createdEntry)
         entry = createdEntry
     }
-    if (!entry) {
-        throw new Error('sqlite connection cache entry was not initialized')
-    }
     entry.refs += 1
     try {
         await entry.connectionPromise
