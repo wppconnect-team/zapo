@@ -38,21 +38,21 @@ jobs:
                   node-version: 22.22.2
                   registry-url: 'https://registry.npmjs.org'
 
-            - name: Install npm compatible with Node 22
-              run: npm install -g npm@11.19.0
+            - name: Verify pinned npm
+              run: npx --yes npm@11.18.0 --version
 
             - name: Install dependencies
-              run: npm ci || npm install
+              run: npx --yes npm@11.18.0 ci
 
             - name: Build (root package)
-              run: npm run build
+              run: npx --yes npm@11.18.0 run build
 
             - name: Publish root package to npm
               run: |
                   NAME=$(node -p "require('./package.json').name")
                   VERSION=$(node -p "require('./package.json').version")
-                  if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+                  if npx --yes npm@11.18.0 view "$NAME@$VERSION" version >/dev/null 2>&1; then
                     echo "$NAME@$VERSION already published, skipping."
                   else
-                    npm publish --workspaces=false --access public --provenance
+                    npx --yes npm@11.18.0 publish --workspaces=false --access public --provenance
                   fi
