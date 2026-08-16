@@ -10,6 +10,8 @@ module.exports = [
             'packages/*/dist/**',
             'packages/*/binding.js',
             'packages/*/binding.d.ts',
+            'packages/native/wasm/pkg/**',
+            '**/___*',
             'wa-web/**',
             'wa-mob/**',
             'coverage/**',
