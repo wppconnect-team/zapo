@@ -4,7 +4,7 @@ Publishes the **root** package of this monorepo to npm as **`@wppconnect/zapo`**
 from the **`publish`** branch via **OIDC trusted publishing** (no npm token).
 
 > zapo is a monorepo (`workspaces: packages/*`). Only the root client package is
-> published, with `--workspaces=false`. The sub-packages (store-*, media-utils,
+> published, with `--workspaces=false`. The sub-packages (store-\*, media-utils,
 > ...) are not republished here — decide on those separately if needed.
 
 ## Why a `publish` branch
