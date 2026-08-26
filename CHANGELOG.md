@@ -1,5 +1,13 @@
 # zapo-js
 
+## 1.8.1
+
+### Patch Changes
+
+- Resolve the stored message author from the top-level `WebMessageInfo.participant`, the way wa-web's `buildMsgKey` does, instead of reading `key.participant` alone. History sync wrote 97.5% of the group rows on a real account with neither `senderJid` nor `participantJid`, and `participantJid` was never written by any history path - only by the live one. The resolution moved into `resolveWebMessageInfoAuthor`, shared by history sync and the group history bundle, with the self-sent fallback to the account itself and the thread-JID fallback scoped to 1:1 - group and broadcast leave both fields empty when the author is unknown rather than naming the group as the author of its own messages. Resolution happens at persist time, where the thread JID is always known; parking keeps only the three author-bearing fields, so peak memory is unchanged. Stale rows cannot be backfilled: `messageBytes` holds the inner `Message`, not the `WebMessageInfo`.
+- Skip the streaming sidecar for mp4 that is not faststart. The sidecar advertises the payload as seekable and routes the recipient into the streaming download engine, which needs the ISO-BMFF `moov` box ahead of `mdat`; with `moov` at the end of the file the player never starts and opening the video fails outright instead of falling back to a plain download. WhatsApp Web does not hit this because every video it sends is remuxed by mp4RepairMux before encryption. The leading top-level boxes are now walked and the sidecar is attached only when the payload can be played progressively; anything that is not ISO-BMFF keeps the sidecar unchanged, since Ogg/Opus carries its index inline. The verdict settles inside the first chunk, so the sidecar accumulator is released before it accumulates anything - for an affected file that lowers peak memory instead of costing any.
+- Let the retry ladder reach count 3 before delegating to the placeholder resend. The sender only rebuilds its Signal session once a receipt arrives above count 2: count 2 records the session base key, count 3 compares it and, when unchanged, drops the session so the next copy arrives as a pkmsg. Delegating at count 3 consumed that attempt and suppressed the receipt, so the ladder stopped at 2 and the peer kept re-encrypting on the same broken session - the peer-data response came back over it and failed to decrypt as well, leaving the message unrecoverable on a "message too far in future" error. The handoff moved to count 4.
+
 ## 1.8.0
 
 ### Minor Changes

@@ -3,8 +3,9 @@ import type { WriteBehindPersistence } from '@client/persistence/WriteBehindPers
 import type { WaClientEventMap, WaHistorySyncChunkEvent } from '@client/types'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
+import { resolveWebMessageInfoAuthor } from '@message/primitives/incoming'
 import { proto, type Proto } from '@proto'
-import { isUserJid } from '@protocol/jid'
+import { isBroadcastJid, isGroupJid, isUserJid } from '@protocol/jid'
 import { normalizeEphemeralSettingSeconds } from '@protocol/message'
 import { normalizeUsername } from '@protocol/username'
 import type { WaChatMetadataStore } from '@store/contracts/chat-metadata.store'
@@ -73,11 +74,17 @@ interface WaHistorySyncDeps {
     readonly onNctSalt?: (salt: Uint8Array) => Promise<void>
     /** Acks the chunk via the `hist_sync` receipt so the primary stops resending it. */
     readonly onProcessed?: (syncType: Proto.Message.HistorySyncType) => Promise<void>
+    /** Author fallback for self-sent group messages that carry no participant. */
+    readonly meJid?: string | null
 }
 
 interface ParkedHistoryMessage {
     readonly id: string
-    readonly senderJid: string | undefined
+    /**
+     * The author-bearing fields of the record, trimmed off the decoded
+     * `WebMessageInfo` so parking a message never retains the whole envelope.
+     */
+    readonly authorInfo: Proto.IWebMessageInfo
     readonly fromMe: boolean
     readonly timestampMs: number | undefined
     readonly messageBytes: Uint8Array
@@ -242,18 +249,7 @@ async function consumeHistorySyncStream(
                     parked[parked.length] = message
                     return undefined
                 }
-                state.messagesCount += 1
-                pushWrite(
-                    state,
-                    deps.writeBehind.persistMessageAsync({
-                        id: message.id,
-                        threadJid,
-                        senderJid: message.senderJid,
-                        fromMe: message.fromMe,
-                        timestampMs: message.timestampMs,
-                        messageBytes: message.messageBytes
-                    })
-                )
+                persistHistoryMessage(deps, state, message, threadJid)
                 return maybeFlush(state)
             }
 
@@ -408,21 +404,44 @@ async function closeConversation(
     }
 
     for (const message of parked ?? []) {
-        state.messagesCount += 1
-        pushWrite(
-            state,
-            deps.writeBehind.persistMessageAsync({
-                id: message.id,
-                threadJid: resolvedJid,
-                senderJid: message.senderJid,
-                fromMe: message.fromMe,
-                timestampMs: message.timestampMs,
-                messageBytes: message.messageBytes
-            })
-        )
+        persistHistoryMessage(deps, state, message, resolvedJid)
     }
 
     await maybeFlush(state)
+}
+
+/**
+ * Resolves the author here rather than at decode time because a message may be
+ * read before its `Conversation.id`, and the thread type decides both the
+ * self-sent fallback and the shape of the record.
+ *
+ * `participantJid` carries the group/broadcast author and stays absent in 1:1
+ * threads, where `senderJid` falls back to the thread JID - the same shape the
+ * live message path persists. A group author that stays unresolved leaves both
+ * fields empty: writing the group JID there would read downstream as if the
+ * group itself had sent the message.
+ */
+function persistHistoryMessage(
+    deps: WaHistorySyncDeps,
+    state: HistorySyncChunkState,
+    message: ParkedHistoryMessage,
+    threadJid: string
+): void {
+    state.messagesCount += 1
+    const authorJid = resolveWebMessageInfoAuthor(message.authorInfo, deps.meJid, threadJid)
+    const isGroupOrBroadcast = isGroupJid(threadJid) || isBroadcastJid(threadJid)
+    pushWrite(
+        state,
+        deps.writeBehind.persistMessageAsync({
+            id: message.id,
+            threadJid,
+            senderJid: isGroupOrBroadcast ? authorJid : (authorJid ?? threadJid),
+            participantJid: isGroupOrBroadcast ? authorJid : undefined,
+            fromMe: message.fromMe,
+            timestampMs: message.timestampMs,
+            messageBytes: message.messageBytes
+        })
+    )
 }
 
 async function settleHistorySyncChunk(
@@ -504,7 +523,11 @@ function readHistoryMessage(record: Uint8Array): ParkedHistoryMessage | null {
     const timestampMs = longToNumber(webMsg.messageTimestamp) * 1000
     return {
         id: webMsg.key.id,
-        senderJid: webMsg.key.participant ?? undefined,
+        authorInfo: {
+            key: { fromMe: webMsg.key.fromMe, participant: webMsg.key.participant },
+            participant: webMsg.participant,
+            originalSelfAuthorUserJidString: webMsg.originalSelfAuthorUserJidString
+        },
         fromMe: webMsg.key.fromMe === true,
         timestampMs: timestampMs || undefined,
         messageBytes: proto.Message.encode(webMsg.message).finish()
