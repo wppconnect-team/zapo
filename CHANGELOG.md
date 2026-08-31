@@ -1,5 +1,12 @@
 # zapo-js
 
+## 1.8.2
+
+### Patch Changes
+
+- Size the group phash buffers from the input instead of a fixed 2048-participant ceiling. `computePhashV2` runs on every group and broadcast-list fanout, so a group resolving to more devices than that ceiling threw and was unreachable through the library rather than merely degraded - an 823 member group resolves to 2118 devices once each member's linked web and desktop companions are counted. wa-web's `phashV2` has no ceiling at all, so 2048 was a buffer-sizing artifact, not a protocol limit. A single upfront pass over the participant lengths bounds the exact byte count, which makes truncation impossible by construction; the buffers are allocated lazily and grown on demand, dropping the 208 KB the module reserved at import even for accounts that never send to a group, and retention is capped at 1 MiB of canonical bytes with longer lists served by a throwaway allocation. Output is byte-identical to the previous implementation for every list the old ceiling allowed.
+- Request the next offline batch until the queue drains. The coordinator asked the server for a single 200-stanza window per connection and never requested another, so the server waited for a request that never came and the idle timer force-completed the resume 60s later, discarding the state: any queue larger than the batch size could never drain, and it grew on every reconnect. The pull loop now mirrors the WhatsApp Web client - every delivered stanza clears the in-flight flag and schedules the next window, capped at one request per 100ms, and termination follows the terminal `offline` bulletin or the stanza timeout rather than a client-side counter. A rejected `sendNode` retries on the same debounce, bounded by a retry cap and pinned to a resume generation so a rejection arriving after a reset cannot act on the current resume. The `remainingStanzas` and `forced` docs on `WaOfflineResumeEvent` were corrected to match the implementation.
+
 ## 1.8.1
 
 ### Patch Changes
