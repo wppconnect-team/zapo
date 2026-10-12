@@ -1,8 +1,14 @@
+import { readFile } from 'node:fs/promises'
+
 import type { Logger } from 'zapo-js'
+import { toBytesView } from 'zapo-js/util'
 
 import {
+    dialableRelayEndpoints,
     type InboundVideoFrame,
     type InboundVideoRtpPacket,
+    type MLowCompanionModelSource,
+    type MLowRedOptions,
     type WaCallMediaEvent,
     type WaCallMediaMessage,
     WaCallMediaMessageSequencer,
@@ -19,6 +25,8 @@ export interface WaCallMediaLinkEvents {
     /** Media started flowing: the call is accepted and a relay leg is up. */
     onActive(): void
     onRelayLost(reason: string): void
+    /** A relay answered one of our legs for the first time; `rttMs` when the media measured one. */
+    onRelayAnswered(name: string, rttMs?: number): void
     onReaction(reaction: WaCallReaction): void
     onInboundAudio(pcm: Float32Array): void
     onInboundVideoRtp(packet: InboundVideoRtpPacket): void
@@ -49,11 +57,34 @@ export interface WaCallMediaLink {
     snapshot(): WaCallMediaMessage | null
 }
 
+/**
+ * The Companion weights as the media takes them: bytes as they are, a path as a loader that reads
+ * the file once, on the first call that asks, and shares that read with every call after.
+ */
+export function toCompanionModelSource(
+    model: Uint8Array | ArrayBuffer | string | undefined
+): MLowCompanionModelSource | undefined {
+    if (typeof model !== 'string') return model
+    let read: Promise<Uint8Array> | null = null
+    return () => {
+        read ??= readFile(model).then(
+            (bytes) => toBytesView(bytes),
+            (err: unknown) => {
+                read = null
+                throw err
+            }
+        )
+        return read
+    }
+}
+
 export interface WaLocalCallMediaOptions {
     readonly logger: Logger
     readonly events: WaCallMediaLinkEvents
     readonly useOriginalRelayPort: boolean
     readonly useRawUdpTransport: boolean
+    readonly mlowCompanionModel?: MLowCompanionModelSource
+    readonly mlowRed?: boolean | MLowRedOptions
 }
 
 /**
@@ -71,6 +102,8 @@ export class WaLocalCallMedia implements WaCallMediaLink {
             ...nodeMediaHost,
             logger,
             useOriginalRelayPort: options.useOriginalRelayPort,
+            mlowCompanionModel: options.mlowCompanionModel,
+            mlowRed: options.mlowRed,
             createRawUdpLeg: options.useRawUdpTransport
                 ? (legOptions) => new WaRawUdpLeg(legOptions)
                 : undefined,
@@ -80,6 +113,7 @@ export class WaLocalCallMedia implements WaCallMediaLink {
                 events.onActive()
             },
             onRelayLost: (reason) => events.onRelayLost(reason),
+            onRelayAnswered: (name, rttMs) => events.onRelayAnswered(name, rttMs),
             onReaction: (reaction) => events.onReaction(reaction),
             onInboundVideoRtp: (packet) => events.onInboundVideoRtp(packet),
             onInboundVideo: (frame) => events.onInboundVideo(frame)
@@ -208,10 +242,14 @@ export class WaRemoteCallMedia implements WaCallMediaLink {
             case 'active':
                 if (this.active) return
                 this.active = true
+                if (!event.reportsRelayAnswers) this.assumeDialledRelaysAnswered()
                 this.events.onActive()
                 return
             case 'relay_lost':
                 this.events.onRelayLost(event.reason)
+                return
+            case 'relay_answered':
+                this.events.onRelayAnswered(event.name, event.rttMs)
                 return
             case 'reaction':
                 this.events.onReaction(event.reaction)
@@ -224,6 +262,14 @@ export class WaRemoteCallMedia implements WaCallMediaLink {
 
     snapshot(): WaCallMediaMessage {
         return this.sequencer.snapshot()
+    }
+
+    /** A host older than `relay_answered` names no relay: once its media is up, all we dial count. */
+    private assumeDialledRelaysAnswered(): void {
+        const endpoints = this.sequencer.snapshot().plan.relays?.endpoints ?? []
+        for (const endpoint of dialableRelayEndpoints(endpoints)) {
+            if (endpoint.name) this.events.onRelayAnswered(endpoint.name)
+        }
     }
 }
 

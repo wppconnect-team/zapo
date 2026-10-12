@@ -426,7 +426,20 @@ plugins: [voipPlugin({ useOriginalRelayPort: true })]
 
 ## Codec
 
-MLow runs through **`libmlow-wasm-fork`** (≥ 0.2.0): 16 kHz, mono, 960-sample frames (60 ms), `useSmpl: true`, DTX enabled. No `koffi`, no bundled native libraries.
+MLow runs through **`libmlow-wasm-fork`** (≥ 0.2.0): 16 kHz, mono, 960-sample frames (60 ms), `useSmpl: true`, DTX enabled. No `koffi`, no bundled native libraries. With `mlowRed` off, when the call's `<voip_settings>` carry `rc.maxfpp` 2 on the 60 ms `frame_ms`, up to two consecutive speech frames go out per packet, as the official 1:1 client sends them; a frame with the VAD bit clear, or the one left waiting when capture pauses, goes alone. With `mlowRed` on, each packet carries the low-rate copy of the previous frame, when there is one, then the frame, stamped with the copy's timestamp, and DTX is off.
+
+```ts
+plugins: [
+    voipPlugin({
+        // WhatsApp's MLow Companion weights (`mlow_companion_v1.pte`), not shipped: bytes or a path
+        mlowCompanionModel: '/models/mlow_companion_v1.pte',
+        // Off by default; turning it on turns DTX off
+        mlowRed: false
+    })
+]
+```
+
+The Companion is the neural post-filter WhatsApp runs in its decoder. Measured on `libmlow-wasm-fork` 0.2.0 it reshapes the 60 ms frames of a 1:1 call too, although the library documents it for 20 ms ones, at about 40 times the decode CPU. Weights that fail to load leave calls decoding without it, with a warning. With remote media both options belong to the host's `WaCallMediaReceiver`.
 
 The signaling and media stack (RTP/SRTP, SCTP relay, codec, audio engine) is internal to the package; use `client.voip` and the events above.
 

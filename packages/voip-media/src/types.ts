@@ -6,6 +6,11 @@ export interface SrtpKeyingMaterial {
 
 export enum PayloadType {
     WhatsAppOpus = 120,
+    /**
+     * `mlow-red-1`: once the server negotiates it, a peer sends all of its audio here, as plain
+     * MLow frames with their in-band FEC.
+     */
+    WhatsAppMlowRed = 121,
     WhatsAppH264 = 97,
     /**
      * Lowest payload type of WhatsApp's proprietary Reed-Solomon video FEC
