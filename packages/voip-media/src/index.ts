@@ -60,12 +60,19 @@ export {
 export { H264Depacketizer, isH264KeyFrame, packetizeH264AnnexB } from './media/h264.js'
 export type { H264AccessUnit } from './media/h264.js'
 export { MLOW_ENCODER_CTL, MLowCodec } from './media/mlow-codec.js'
-export type { MLowCodecOptions, MLowCodecStats, MLowEncoderTunables } from './media/mlow-codec.js'
+export type {
+    MLowCodecOptions,
+    MLowCodecStats,
+    MLowCompanionModelSource,
+    MLowEncoderTunables,
+    MLowRedOptions
+} from './media/mlow-codec.js'
 export {
     buildFullIntraRequest,
     buildPictureLossIndication,
     buildReceiverEstimatedMaxBitrate,
     buildSenderReportWithSdes,
+    nextAudioReceiverEstimate,
     nextReceiverMaxBitrate,
     RTCP_CNAME_LENGTH,
     RtpStreamReception,

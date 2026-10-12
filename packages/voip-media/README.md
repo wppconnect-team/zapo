@@ -40,6 +40,9 @@ const plane = new WaCallMediaPlane({
     onRelayLost: (reason) => {
         // no leg left - tell signaling, which ends the call
     },
+    onRelayAnswered: (name, rttMs) => {
+        // a relay answered for the first time - tell signaling, which names only these to the peer
+    },
     onReaction: (reaction) => {
         // an in-band emoji reaction from the peer
     }
@@ -71,6 +74,50 @@ taken as captured as it arrives. Consecutive frames keep consecutive timestamps 
 those instants carry, a pause in the capture goes out as a marked jump, and capture delivered ahead
 of the clock is shed. `sendVideoFrame` takes the host's own capture timestamp in any epoch and maps
 it onto the same clock.
+
+## The codec
+
+Audio is MLow at 16 kHz mono in 60 ms frames. When the plan's settings carry
+`audioFramesPerPacket: 2` (the server's `rc.maxfpp`), two frames share one packet the way the
+official 1:1 client sends them, `[0x92][0x02][length of the first][0x50 ...]`, 120 ms per packet;
+a frame with the VAD bit clear always goes alone. On receive, each sub-frame sits on the RTP
+timeline at its packet's timestamp plus the durations its TOCs give the sub-frames before it, which
+is how the official packets add up. A sub-frame whose stretch already played is a
+redundant copy and is dropped; one that lands where a lost packet left a hole plays in its place.
+Audio a peer sends on PT 121 (`mlow-red-1`) plays on the same timeline, its sequence numbers kept
+apart from PT 120's, so a slot both carry plays once; a PT 121 packet that parses neither as MLow
+nor as in-band RED is dropped and counted in `audioRedDiscarded`.
+
+Once per RTCP interval the plane sends a REMB (PSFB 206, FMT 15) on the peer's audio stream: the
+peer's audio quality control stays in its 15 kbps probing state until one arrives. The value is an
+estimate of our own, 24 kbps at first, 10% up per clean interval to 30 kbps and steady there, 15%
+down from 10% loss, never under 16 kbps. The peer takes the lower of it and its own estimate, so
+the ceiling sits just over its 24 kbps managed band instead of leaving the state to that estimate.
+
+Two options on the plane, also accepted by `WaCallMediaReceiver` on a remote host:
+
+- `mlowCompanionModel`: the weights of the MLow Companion, the neural post-filter WhatsApp runs
+  in its decoder, as bytes or as a loader the plane calls when a call loads the codec. They are
+  WhatsApp's `mlow_companion_v1.pte`, a `DNNw` blob despite the extension, and no package ships
+  them. The library documents it for 20 ms wideband mono frames; measured on 0.2.0 it also
+  reshapes the 60 ms frames of a 1:1 call, at about 40 times the decode CPU (around 4% of one
+  core per stream). Weights that fail to load leave the call decoding without it, with a warning.
+- `mlowRed`: sends RED as a plain two-frame multiframe, the low-rate copy of the previous frame
+  then the frame, stamped with the copy's timestamp. The copy lands on the slot the previous
+  packet filled, so a receiver that orders by timestamp drops it unless that packet was lost.
+  Against WA Web it kept concealment at 3.1% under about 18% loss, with no negotiation. The
+  official in-band layout, a compact RFC 2198 with a `0x00` primary header and each
+  copy counted back in 10 ms steps, stays internal: an official client takes it only on PT 121 and
+  behind its RX gate (`enable_red_pt_support_rx`), which the server sets, and rejects it on
+  PT 120. The receive side reads it on PT 121. Off by default; turning it on turns DTX off,
+  which RED requires.
+
+```ts
+const plane = new WaCallMediaPlane({
+    ...webMediaHost,
+    mlowCompanionModel: () => fetch('/models/mlow_companion_v1.pte').then((r) => r.arrayBuffer())
+})
+```
 
 ## Audio in a browser
 
