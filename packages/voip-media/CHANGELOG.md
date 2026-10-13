@@ -1,5 +1,30 @@
 # @zapo-js/voip-media
 
+## 0.2.0
+
+### Minor Changes
+
+- 04073f8: Pack two 60 ms MLow frames per audio packet when the peer's `voip_settings` allows it (`maxfpp`), as the official clients do, and decode and encode MLow without allocating per frame. PT 121 audio is kept apart from video FEC. An optional MLow Companion model (the NoLACE post-filter, weights supplied by the host) can run on the decoder.
+- 961bdaf: Add `setPlayoutMuted`, `setMicrophone` and `setOutput` to `WaWebCallAudio`, and an `output` option to `start`.
+
+    `setPlayoutMuted` silences the speaker through a gain node with a short ramp and keeps pulling playout, so a call comes back from hold in step. `setMicrophone` swaps only the source node, keeping the worklet and the context; a stream the context refuses throws and leaves the current microphone running. `output` picks the output device through the `sinkId` option of the `AudioContext` constructor, or `setSinkId` where the constructor ignores it, and `setOutput` through `setSinkId` (Chrome, Edge), on the context the adapter creates, which it still resumes and still falls back to the device rate with; where the browser has no `setSinkId` they fail with a `NotSupportedError`, except for the default device, `''`, which the context already plays to. A context passed in keeps its own output.
+
+### Patch Changes
+
+- 04073f8: Send a REMB on the peer's audio stream, and keep MLow RED on the layout the official clients accept.
+
+    The peer's audio quality control stayed in its 15 kbps probing state for the whole call, because it only leaves it on a REMB received on the audio stream. `WaCallMediaPlane` now sends one (PSFB 206, FMT 15) once per RTCP interval, from its audio SSRC on the peer's: 24 kbps at first, up to a steady 30 kbps on a clean stream, down on loss to 16 kbps at least. `vid_rc.disable_rtcp_remb` still applies to the video one only.
+
+    With `mlowRed` on, RED stays the copy-first multiframe stamped on the copy, which WA Web takes without any negotiation. The official in-band layout, a compact RFC 2198 of `[0x80 | 10 ms steps back][length]` per copy, a `0x00` primary header, the copies then the frame, stays internal: an official client takes it only on PT 121 and behind its RX gate (`enable_red_pt_support_rx`), which the server sets, and rejects it on PT 120. `MLowCodec.decodeSequenced` reads the copy-first multiframe on either payload type and the in-band layout on PT 121, playing a copy only in the slot of a lost packet.
+
+- 04073f8: Play the peer's audio when it arrives on PT 121.
+
+    A peer with the separate MLow payload type negotiated sends all of its audio on PT 121, plain MLow frames, and the plane discarded it, so the call went mute. A PT 121 packet that parses as MLow now decodes on the same timeline as PT 120, its sequence numbers kept apart, so a slot both payload types carry plays once. `audioRedDiscarded` counts only the PT 121 packets that parse as neither MLow nor in-band RED. `MLowCodec.decodeSequenced` takes an optional `stream` (0 or 1) for the second numbering.
+
+- 04073f8: Report the relays that answer the call's legs.
+
+    `WaCallMediaPlane` takes an `onRelayAnswered(name, rttMs?)` callback, fired the first time each relay answers, with the round trip from the leg's first allocate when one went out. `WaCallMediaReceiver` sends it to signaling as a `relay_answered` event, and its `active` event now carries `reportsRelayAnswers: true` so signaling can tell it from an older host. The wire version stays 1: signaling that predates the event ignores it.
+
 ## 0.1.2
 
 ### Patch Changes
