@@ -1,5 +1,24 @@
 # @zapo-js/voip
 
+## 1.3.0
+
+### Minor Changes
+
+- 04073f8: Add the `mlowCompanionModel` and `mlowRed` options, follow the peer's `maxfpp` when packing audio, and stop announcing MLow RED (capability bit 36) in video offers.
+
+### Patch Changes
+
+- 04073f8: Name in our `<relaylatency>` only the relays that answered our media.
+
+    Every relay we dial was named, including one our network never reaches. A peer that measured that relay as its fastest elected it and none of its media reached us. A relay is now named once it first answers a leg, each once per call, so a relay that never answers is never named. A remote media host older than this release reports no answers, so once its media is up every relay we dial is named, as before. The callee dials only on accept, so it still names nothing while it rings.
+
+- Updated dependencies [04073f8]
+- Updated dependencies [04073f8]
+- Updated dependencies [04073f8]
+- Updated dependencies [04073f8]
+- Updated dependencies [961bdaf]
+    - @zapo-js/voip-media@0.2.0
+
 ## 1.2.1
 
 ### Patch Changes
