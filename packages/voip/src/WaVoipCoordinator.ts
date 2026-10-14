@@ -9,9 +9,16 @@ import type {
 
 import type { CallInfo } from './call/call-state.js'
 import { WaCallManager } from './call/WaCallManager.js'
-import { routeCallAck, routeCallReceipt, routeCallStanza } from './signaling/bridge.js'
+import { routeCallReceipt, routeCallStanza } from './signaling/bridge.js'
 import type { WaVideoUpgradeResult } from './signaling/signaling.js'
-import type { CallManagerEvents, CallOfferOptions, EndCallReason } from './types.js'
+import type {
+    CallManagerEvents,
+    CallOfferOptions,
+    CallVideoSubscription,
+    EndCallReason
+} from './types.js'
+
+const INBOUND_AUDIO_EVENT = 'voip_call_inbound_audio'
 
 export interface WaVoipCoordinatorOptions {
     /**
@@ -26,43 +33,22 @@ export interface WaVoipCoordinatorOptions {
      */
     readonly logLevel?: LogLevel
     /**
-     * Dial each relay on the port its `<te2>` endpoint advertises instead of on
-     * `TRUE_WEB_CLIENT_RELAY_PORT` (3480). Defaults by session, read per call: `true`
-     * on a companion, `false` on a mobile primary.
-     *
-     * The wire does not say which port a relay answers on: measured, a companion's legs
-     * open only on the advertised port and a primary's only on 3480. A leg the relay never
-     * answers is redialled once on the other port, when there is one: an endpoint that
-     * already advertises 3480 has none.
+     * Dial each relay on the port its `<te2>` endpoint advertises instead of on 3480. Defaults
+     * per call to `true` on a companion and `false` on a mobile primary; a leg that never answers
+     * is redialled once on the other port.
      */
     readonly useOriginalRelayPort?: boolean
     /**
-     * Carry media over a raw UDP socket to each relay instead of over the
-     * WebRTC data channel, and dial every relay on the port its `<te2>`
-     * endpoint advertises. Defaults to `false`.
-     *
-     * Off by default because it buys nothing where it works and is not proven
-     * where it would: a cold-started relay accepts the allocate, answers the
-     * keepalive and forwards the peer's stream to whatever address last sent
-     * to it, so the raw path carries a real call - but only on relays the
-     * WebRTC path already reaches. On one measured relay that WebRTC cannot
-     * reach at all, the same sequence took 1761 uplink packets and returned
-     * nothing, and sending into it appeared to pull the peer's stream off the
-     * leg that had been carrying it.
-     *
-     * Each leg polices itself against that: a leg that sends media and sees no
-     * media come back within a few seconds closes itself, so the previous path
-     * can take the stream back. Turning this on is still an experiment, not a
-     * tuning knob.
+     * Experimental: carry media over a raw UDP socket to each relay instead of the WebRTC data
+     * channel, on the port its `<te2>` endpoint advertises. A leg that sends and hears nothing
+     * back within a few seconds closes itself. Defaults to `false`.
      */
     readonly useRawUdpTransport?: boolean
     /**
-     * Weights of the MLow Companion, the neural post-filter WhatsApp runs in its decoder: the
-     * bytes of `mlow_companion_v1.pte` (a `DNNw` blob despite the name), or a path read once on
-     * the first call. Not shipped with this package. Measured on `libmlow-wasm-fork` 0.2.0 it
-     * reshapes the 60 ms frames of a 1:1 call too, at roughly 40 times the decode CPU. Weights
-     * that fail to load leave calls decoding without it, with a warning. With remote media,
-     * pass it to the host's `WaCallMediaReceiver` as `mlowCompanionModel` instead.
+     * Weights of the MLow Companion decoder post-filter: the bytes of `mlow_companion_v1.pte`, or a
+     * path read on the first call. Not shipped; costs about 40 times the decode CPU, and weights that
+     * fail to load leave calls decoding without it. With remote media, pass it to the host's
+     * `WaCallMediaReceiver` as `mlowCompanionModel` instead.
      */
     readonly mlowCompanionModel?: Uint8Array | ArrayBuffer | string
     /**
@@ -77,6 +63,11 @@ export interface WaVoipCoordinatorOptions {
      * running `WaCallMediaReceiver`, whose events return through {@link WaVoipCoordinator.media}.
      */
     readonly media?: { readonly mode: 'local' | 'remote' }
+    /**
+     * Emits `voip_call_participant_audio`: each group-call participant's decoded audio apart,
+     * before the mix. Off by default, since every frame is copied for it. Local media only.
+     */
+    readonly participantAudio?: boolean
 }
 
 /** The side of `client.voip` a remote media host talks to. */
@@ -120,10 +111,12 @@ export class WaVoipCoordinator {
             useRawUdpTransport: options.useRawUdpTransport,
             mlowCompanionModel: options.mlowCompanionModel,
             mlowRed: options.mlowRed,
-            mediaMode: options.media?.mode
+            mediaMode: options.media?.mode,
+            participantAudio: options.participantAudio
         })
         this.registerIncomingHandlers(ctx)
         this.wireClientEvents(ctx)
+        this.wireInboundAudio(ctx)
     }
 
     /**
@@ -131,6 +124,9 @@ export class WaVoipCoordinator {
      * preloaded `audioFile`). Resolves with the new call id once the offer is
      * sent; progress then arrives via `voip_call_state`. Rejects when at the
      * concurrent-call limit or if the offer fails to send.
+     *
+     * Set `options.groupJid` and `options.participants` to place a group call
+     * instead, addressed to the call itself; `peerJid` is then not read.
      */
     async startCall(options: CallOfferOptions): Promise<string> {
         return this.manager.startCall(options)
@@ -156,10 +152,31 @@ export class WaVoipCoordinator {
     /**
      * End an active or connecting call, optionally with an {@link EndCallReason}
      * (defaults to `UserEnded`). Sends the terminate stanza, then tears the
-     * call down. No-op if the call is unknown or already ended.
+     * call down. No-op if the call is unknown or already ended. On a group call
+     * this only takes us out, like {@link leaveCall}: the call ends for everybody
+     * once its last member leaves, as with the official client.
      */
     async endCall(callId: string, reason?: EndCallReason): Promise<void> {
         return this.manager.endCall(callId, reason)
+    }
+
+    /**
+     * Leave a group call the other participants stay on. The same as {@link endCall} on a
+     * group call, and the call ends for everybody once its last member leaves. No-op if the
+     * call is unknown or already ended; throws on a 1:1 call.
+     */
+    async leaveCall(callId: string): Promise<void> {
+        return this.manager.leaveCall(callId)
+    }
+
+    /**
+     * Join a group call already in progress that this side declined, let ring out or left,
+     * while it goes on. Progress arrives via `voip_call_state`, as on an accepted call. Throws
+     * when no such call is known here (only one this side was rung for), when this side is on
+     * it already, or at the concurrent-call limit.
+     */
+    async joinCall(callId: string): Promise<void> {
+        return this.manager.joinCall(callId)
     }
 
     /**
@@ -181,6 +198,15 @@ export class WaVoipCoordinator {
     }
 
     /**
+     * Ask one participant of a group call to mute, by its device jid. A request: the target
+     * decides, and a `voip_call_peer_mute` follows if it complies. Throws on an unknown
+     * `callId`, a 1:1 call or a failed send.
+     */
+    async requestParticipantMute(callId: string, participantJid: string): Promise<void> {
+        return this.manager.requestParticipantMute(callId, participantJid)
+    }
+
+    /**
      * Raise or lower the local hand on `callId` and announce it to the peer. Durable state:
      * the peer keeps seeing the hand until it is lowered. Repeating it sends nothing, an
      * inactive call is a no-op, and the peer's own hands are `voip_call_hand_raise` /
@@ -195,7 +221,8 @@ export class WaVoipCoordinator {
      * stream: the screen replaces the camera on the call's existing video stream, so
      * whatever reaches {@link feedLiveVideo} from here on is what the peer renders as the
      * share. Throws on an unknown `callId` or a failed send, and - starting a share only -
-     * on a group call or one with no video yet ({@link requestVideoUpgrade} first).
+     * on a call with no video yet ({@link requestVideoUpgrade} or {@link setVideoEnabled}
+     * first).
      */
     async setScreenShare(callId: string, sharing: boolean): Promise<void> {
         return this.manager.setScreenShare(callId, sharing)
@@ -210,11 +237,35 @@ export class WaVoipCoordinator {
     }
 
     /**
+     * Turn our camera on or off on a group call: whatever reaches {@link feedLiveVideo}
+     * afterwards goes to the call, and the others are told. A no-op on an inactive call.
+     * Throws on an unknown `callId`, a failed send, or a 1:1 call, which turns video on
+     * through {@link requestVideoUpgrade}.
+     */
+    async setVideoEnabled(callId: string, enabled: boolean): Promise<void> {
+        return this.manager.setVideoEnabled(callId, enabled)
+    }
+
+    /**
+     * Choose which participants' video a group call asks the relay for, and at what quality.
+     * `null` returns to the default: every participant with the camera on. Not applied by a
+     * media host that cannot carry it. Throws on an unknown `callId`.
+     */
+    setVideoSubscriptions(
+        callId: string,
+        subscriptions: readonly CallVideoSubscription[] | null
+    ): void {
+        this.manager.setVideoSubscriptions(callId, subscriptions)
+    }
+
+    /**
      * Ask the peer to turn an audio call into a video call and wait for the answer. Resolves
      * with one of {@link WA_VIDEO_UPGRADE_RESULT}; only `accepted` means
      * {@link feedLiveVideo} now reaches the wire. Bounded by the peer's own guard timer, so
-     * it settles in about five seconds even against a client that never answers. Throws on
-     * an unknown `callId`, an inactive call, or one that already carries video.
+     * it settles in about five seconds even against a client that never answers. On a group
+     * call the server is asked instead: `accepted` once it turns the call into a video call,
+     * with our camera on; a group call already carrying video only turns the camera on.
+     * Throws on an unknown `callId`, an inactive call, or one where we already send video.
      */
     async requestVideoUpgrade(callId: string): Promise<WaVideoUpgradeResult> {
         return this.manager.requestVideoUpgrade(callId)
@@ -364,7 +415,7 @@ export class WaVoipCoordinator {
                     if (node.attrs.class !== 'call') {
                         return false
                     }
-                    await routeCallAck(this.manager, node)
+                    await this.manager.handleCallAck(node)
                     return true
                 }
             }),
@@ -374,6 +425,37 @@ export class WaVoipCoordinator {
                 handler: async (node) => routeCallReceipt(this.deps, node)
             })
         )
+    }
+
+    /** Forwards inbound audio only while the client listens, so no listener costs no copy. */
+    private wireInboundAudio(ctx: WaClientPluginContext): void {
+        const { client } = ctx
+        const forward = (call: CallInfo, pcm: Float32Array): void => {
+            ctx.emit(INBOUND_AUDIO_EVENT, { call, pcm })
+        }
+        let forwarding = false
+        const setForwarding = (wanted: boolean): void => {
+            if (wanted === forwarding) return
+            forwarding = wanted
+            if (wanted) this.manager.on('call_inbound_audio', forward)
+            else this.manager.off('call_inbound_audio', forward)
+        }
+        const onAdded = (event: string | symbol): void => {
+            if (event === INBOUND_AUDIO_EVENT) setForwarding(true)
+        }
+        const onRemoved = (event: string | symbol): void => {
+            if (event === INBOUND_AUDIO_EVENT) {
+                setForwarding(client.listenerCount(INBOUND_AUDIO_EVENT) > 0)
+            }
+        }
+        client.addListener('newListener', onAdded)
+        client.addListener('removeListener', onRemoved)
+        setForwarding(client.listenerCount(INBOUND_AUDIO_EVENT) > 0)
+        this.unregisterHandlers.push(() => {
+            client.removeListener('newListener', onAdded)
+            client.removeListener('removeListener', onRemoved)
+            setForwarding(false)
+        })
     }
 
     private wireClientEvents(ctx: WaClientPluginContext): void {
@@ -386,23 +468,35 @@ export class WaVoipCoordinator {
         this.manager.on('call_ended', (call) => {
             ctx.emit('voip_call_ended', call)
         })
-        this.manager.on('call_peer_mute', (call, muted) => {
-            ctx.emit('voip_call_peer_mute', { call, muted })
+        this.manager.on('call_peer_mute', (call, muted, participantJid) => {
+            ctx.emit('voip_call_peer_mute', { call, muted, participantJid })
         })
-        this.manager.on('call_inbound_audio', (call, pcm) => {
-            ctx.emit('voip_call_inbound_audio', { call, pcm })
+        this.manager.on('call_mute_requested', (call, participantJid, requestState) => {
+            ctx.emit('voip_call_mute_requested', { call, participantJid, requestState })
         })
-        this.manager.on('call_inbound_video_rtp', (call, packet) => {
-            ctx.emit('voip_call_inbound_video_rtp', { call, packet })
+        this.manager.on('call_participant_audio', (call, participantJid, pcm) => {
+            ctx.emit('voip_call_participant_audio', { call, participantJid, pcm })
         })
-        this.manager.on('call_inbound_video', (call, frame) => {
-            ctx.emit('voip_call_inbound_video', { call, frame })
+        this.manager.on('call_participant_media', (call, participantJid, receiving) => {
+            ctx.emit('voip_call_participant_media', { call, participantJid, receiving })
         })
-        this.manager.on('call_screen_share', (call, share) => {
-            ctx.emit('voip_call_screen_share', { call, share })
+        this.manager.on('call_inbound_video_rtp', (call, packet, participantJid) => {
+            ctx.emit('voip_call_inbound_video_rtp', { call, packet, participantJid })
         })
-        this.manager.on('call_peer_video_state', (call, change) => {
-            ctx.emit('voip_call_peer_video_state', { call, change })
+        this.manager.on('call_inbound_video', (call, frame, participantJid) => {
+            ctx.emit('voip_call_inbound_video', { call, frame, participantJid })
+        })
+        this.manager.on('call_screen_share', (call, share, participantJid) => {
+            ctx.emit('voip_call_screen_share', { call, share, participantJid })
+        })
+        this.manager.on('call_peer_video_state', (call, change, participantJid) => {
+            ctx.emit('voip_call_peer_video_state', { call, change, participantJid })
+        })
+        this.manager.on('call_video_upgraded', (call, participantJid) => {
+            ctx.emit('voip_call_video_upgraded', { call, participantJid })
+        })
+        this.manager.on('call_participants_changed', (call, diff) => {
+            ctx.emit('voip_call_participants_changed', { call, diff })
         })
         this.manager.on('call_outbound_audio_finished', (call) => {
             ctx.emit('voip_call_outbound_audio_finished', call)
@@ -410,8 +504,8 @@ export class WaVoipCoordinator {
         this.manager.on('call_hand_raise', (call, participantJid, raised) => {
             ctx.emit('voip_call_hand_raise', { call, participantJid, raised })
         })
-        this.manager.on('call_reaction', (call, reaction) => {
-            ctx.emit('voip_call_reaction', { call, reaction })
+        this.manager.on('call_reaction', (call, reaction, participantJid) => {
+            ctx.emit('voip_call_reaction', { call, reaction, participantJid })
         })
         this.manager.on('call_media', (call, message) => {
             ctx.emit('voip_call_media', { call, message })

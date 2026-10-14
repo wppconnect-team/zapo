@@ -1,11 +1,18 @@
 import type { Logger } from 'zapo-js'
 import { normalizeDeviceJid, toUserJid } from 'zapo-js/protocol'
-import { type BinaryNode, getFirstNodeChild, getNodeChildrenByTag } from 'zapo-js/transport'
-import { toError, uint8TimingSafeEqual } from 'zapo-js/util'
+import {
+    type BinaryNode,
+    findNodeChild,
+    getFirstNodeChild,
+    getNodeChildrenByTag
+} from 'zapo-js/transport'
+import { toError, tryAsNumber, uint8TimingSafeEqual } from 'zapo-js/util'
 
 import {
     dialableRelayEndpoints,
+    WA_VIDEO_QUALITY,
     type WaCallMediaEvent,
+    type WaCallMediaGroup,
     type WaCallMediaKeys,
     type WaCallMediaMessage,
     type WaCallMediaPlanUpdate,
@@ -14,18 +21,20 @@ import {
     type WaCallMediaSettings,
     type WaCallMediaSsrcs,
     type WaCallMediaVideo,
+    type WaCallMediaVideoSubscription,
     type WaCallReaction
 } from '@zapo-js/voip-media'
 
 import { readUInt32BE } from '../bytes.js'
-import { derivePerJidSrtpKey } from '../crypto/encryption.js'
-import {
-    generateSecureSsrc,
-    WA_AUDIO_CALL_SSRC_SLOTS,
-    WA_SSRC_SLOT,
-    WA_VIDEO_CALL_SSRC_SLOTS
-} from '../crypto/ssrc.js'
+import { derivePerJidSrtpKey, generateCallKey } from '../crypto/encryption.js'
+import { WA_AUDIO_CALL_SSRC_SLOTS, WA_SSRC_SLOT, WA_VIDEO_CALL_SSRC_SLOTS } from '../crypto/ssrc.js'
+import { groupParticipantAccountKey, isSameDeviceJid, toDeviceJid } from '../jid.js'
 import { parseRelayFromAck } from '../relay/relay-ack.js'
+import {
+    type GroupCallRoster,
+    type GroupInfoParticipant,
+    readGroupCallRoster
+} from '../signaling/group-info.js'
 import {
     buildScreenShareStanza,
     parseScreenShareNode,
@@ -35,7 +44,11 @@ import {
 import {
     buildAcceptReceiptStanza,
     buildAcceptStanza,
+    buildEncRekeyStanza,
+    buildHeartbeatStanza,
+    buildMuteRequestStanza,
     buildMuteV2Stanza,
+    buildPeerStateStanza,
     buildPreacceptStanza,
     buildRaiseHandStanza,
     buildRejectStanza,
@@ -50,6 +63,8 @@ import {
     parseMuteV2,
     parseRaiseHandState,
     parseVideoStateNode,
+    toCallServerJid,
+    WA_PEER_STATE,
     WA_VIDEO_STATE,
     WA_VIDEO_UPGRADE_RESULT,
     WA_VIDEO_UPGRADE_TIMEOUT_MS,
@@ -60,15 +75,37 @@ import {
     CallDirection,
     CallMediaType,
     CallState,
+    type CallVideoSubscription,
     EndCallReason,
     type InboundVideoFrame,
     type InboundVideoRtpPacket,
     type PeerVideoStateChange,
+    type RelayData,
     type RelayEndpoint,
     type WaVoipDeps
 } from '../types.js'
 
-import { type CallInfo } from './call-state.js'
+import { type CallInfo, type WaCallParticipantMedia } from './call-state.js'
+import {
+    adoptableRelayEndpoints,
+    adoptedRelayTransport,
+    groupDevicePids,
+    groupSenderDeviceJids,
+    sameRelayCredentials,
+    sameRelayEndpointSet,
+    selectVideoSubscriptions,
+    WaCallDerivations
+} from './group-media-plan.js'
+import {
+    applyGroupUpdate,
+    createGroupComposition,
+    diffGroupParticipants,
+    isGroupParticipantLeaving,
+    WA_CALL_PARTICIPANT_STATE,
+    type WaCallGroupParticipant,
+    type WaGroupComposition,
+    type WaGroupCompositionDiff
+} from './group-participants.js'
 import type { WaCallMediaLink, WaCallMediaLinkEvents } from './media-link.js'
 import {
     type PeerVideoReadyGateReason,
@@ -76,11 +113,7 @@ import {
     WaPeerVideoReadyGate
 } from './WaPeerVideoReadyGate.js'
 
-/**
- * Stream slots a video call registers with the relay and an audio call does not: what
- * an accepted upgrade has to add. Derived from the two lists, so a slot added to the
- * video set later reaches the upgrade path on its own.
- */
+/** Slots a video call registers with the relay and an audio call does not: what an upgrade adds. */
 const VIDEO_ONLY_SSRC_SLOTS: readonly number[] = WA_VIDEO_CALL_SSRC_SLOTS.filter(
     (slot) => !WA_AUDIO_CALL_SSRC_SLOTS.includes(slot as never)
 )
@@ -91,31 +124,19 @@ const MAX_TRACKED_RAISED_HANDS = 32
 /** Same kind of guard as {@link MAX_TRACKED_RAISED_HANDS}, one per peer device. */
 const MAX_TRACKED_PEER_APP_DATA_SSRCS = 32
 
-/** Same kind of guard again, one per relay the peer names. */
-const MAX_TRACKED_PEER_RELAY_LATENCIES = 32
+/** One entry per device the stanzas name: 32 connected participants, five devices each. */
+const MAX_TRACKED_PARTICIPANT_MEDIA = 160
 
-/** Sections and keys of `<voip_settings>` that describe the app-data stream. */
-const VOIP_SETTINGS_OPTIONS_SECTION = 'options'
-const VOIP_SETTINGS_SFRAME_SECTION = 'sframe'
-const ENABLE_APP_DATA_STREAM_KEY = 'enable_app_data_stream'
-const APP_DATA_STREAM_VERSION_KEY = 'app_data_stream_version'
-const ENABLE_SFRAME_KEY = 'enable_sframe'
-const ENABLE_SFRAME_RX_KEY = 'enable_sframe_rx'
+/** How long a connected sender may go unheard before we report it invisible; RTCP counts as heard. */
+const PEER_INVISIBLE_AFTER_MS = 20_000
 
-/** Whether the profile asked for inbound `<video>` transaction ids to be enforced. */
-const VIDEO_STATE_TXN_RECV_ENFORCE_KEY = 'video_state_txn_id_recv_enforce'
+/** Every connected member of a group call sends the call a `<heartbeat>` this often. */
+const HEARTBEAT_INTERVAL_MS = 10_000
+/** How often that is checked. */
+const PEER_INVISIBLE_SWEEP_MS = 5_000
 
-/**
- * Whether the server announced SFrame for this call's app data. It takes both gates:
- * with either off the peer expects no trailer and reads the message straight out of the
- * SRTP payload. Absent keys resolve to off.
- */
-function resolveAppDataSframe(settings: WaVoipSettings): boolean {
-    return (
-        settings.getFlag(VOIP_SETTINGS_SFRAME_SECTION, ENABLE_SFRAME_KEY, false) &&
-        settings.getFlag(VOIP_SETTINGS_SFRAME_SECTION, ENABLE_SFRAME_RX_KEY, false)
-    )
-}
+/** Least time between two changes of the video subscriptions. */
+const VIDEO_SUBSCRIPTION_MIN_INTERVAL_MS = 2_000
 
 /** Duration of the frame the codec encodes; the server's `frame_ms` has to match to bundle. */
 const CODEC_FRAME_MS = 60
@@ -159,6 +180,12 @@ function samePlanValue(left: unknown, right: unknown): boolean {
     return false
 }
 
+/** The `<terminate>` reason for an offer the server refused. */
+const SETUP_FAILED_REASON = 'setup_failed'
+
+/** Stands in for the `<group_info>` of an update that carried none. */
+const NO_LISTED_PARTICIPANTS: readonly GroupInfoParticipant[] = []
+
 /** The shape the media plan gives a relay endpoint the server listed. */
 function toMediaRelay(endpoint: RelayEndpoint): WaCallMediaRelay {
     return {
@@ -176,6 +203,22 @@ function toMediaRelay(endpoint: RelayEndpoint): WaCallMediaRelay {
     }
 }
 
+/** Our own jid as the credentials name it, lid first; empty before login. */
+export function selfJidOf(deps: Pick<WaVoipDeps, 'authClient'>): string {
+    const creds = deps.authClient.getCurrentCredentials()
+    return creds?.meLid || creds?.meJid || ''
+}
+
+/** The `transaction-id` of a `group_update`: its `<group_info>`'s, else the wrapper's. */
+export function readGroupUpdateTransactionId(inner: BinaryNode): number | null {
+    return (
+        tryAsNumber(findNodeChild(inner, 'group_info')?.attrs?.['transaction-id']) ??
+        tryAsNumber(inner.attrs?.['transaction-id'])
+    )
+}
+
+type SendLogLevel = 'trace' | 'warn' | 'error'
+
 /** One relay as our `<te>` names it. */
 interface OwnRelayLatency {
     readonly relayName: string
@@ -183,11 +226,7 @@ interface OwnRelayLatency {
     readonly addressBytes: Uint8Array
 }
 
-/**
- * An upgrade request sent from this side and not yet answered. `settle` resolves the
- * promise `requestVideoUpgrade` handed back; dropping the attempt is what keeps the
- * peer's answer, the guard timer and a local cancel from settling it twice.
- */
+/** An upgrade request this side sent and nobody answered yet; dropped once settled. */
 interface PendingVideoUpgrade {
     readonly timer: ReturnType<typeof setTimeout>
     readonly settle: (result: WaVideoUpgradeResult) => void
@@ -198,18 +237,37 @@ export interface WaCallMediaSessionDelegate {
     emitState(call: CallInfo): void
     emitIncoming(call: CallInfo): void
     emitEnded(call: CallInfo): void
-    emitPeerMute(call: CallInfo, muted: boolean): void
+    /** `participantJid` is the device that announced it, device 0 bare. */
+    emitPeerMute(call: CallInfo, muted: boolean, participantJid?: string): void
     emitInboundAudio(call: CallInfo, data: Float32Array): void
-    emitInboundVideoRtp(call: CallInfo, packet: InboundVideoRtpPacket): void
-    emitInboundVideo(call: CallInfo, frame: InboundVideoFrame): void
-    emitScreenShare(call: CallInfo, share: PeerScreenShare): void
-    emitPeerVideoState(call: CallInfo, change: PeerVideoStateChange): void
+    emitInboundVideoRtp(
+        call: CallInfo,
+        packet: InboundVideoRtpPacket,
+        participantJid?: string
+    ): void
+    emitInboundVideo(call: CallInfo, frame: InboundVideoFrame, participantJid?: string): void
+    emitScreenShare(call: CallInfo, share: PeerScreenShare, participantJid?: string): void
+    emitPeerVideoState(call: CallInfo, change: PeerVideoStateChange, participantJid?: string): void
     emitOutboundAudioFinished(call: CallInfo): void
     emitHandRaise(call: CallInfo, participantJid: string, raised: boolean): void
     /** One in-band emoji reaction, deduplicated: the sender repeats it, this fires once. */
-    emitCallReaction?(call: CallInfo, reaction: WaCallReaction): void
+    emitCallReaction?(call: CallInfo, reaction: WaCallReaction, participantJid?: string): void
+    /** A participant asked us to mute, with `request-state` as it arrived. Nothing is muted. */
+    emitMuteRequested?(call: CallInfo, participantJid: string, requestState: string): void
+    /** A group participant's media started or stopped reaching us. */
+    emitParticipantMedia?(call: CallInfo, participantJid: string, receiving: boolean): void
+    /** One group participant's decoded audio, before the mix. */
+    emitParticipantAudio?(call: CallInfo, participantJid: string, pcm: Float32Array): void
+    /** The server turned a group call into a video call, at `upgraderJid`'s request when known. */
+    emitVideoUpgraded?(call: CallInfo, upgraderJid: string | null): void
+    /** Whether anything takes {@link emitInboundAudio} right now; absent means always. */
+    wantsInboundAudio?(): boolean
     /** A change to the media plan, for a host elsewhere to apply; remote media only. */
     emitMediaPlan?(call: CallInfo, message: WaCallMediaMessage): void
+    /** Who joined, left or moved on a group call; `call.groupComposition` is the result. */
+    emitParticipantsChanged?(call: CallInfo, diff: WaGroupCompositionDiff): void
+    /** A problem the call carries on through. */
+    emitError?(call: CallInfo, error: Error): void
     /** Ends the call through its owner, for a session that has to end itself. */
     endCall(call: CallInfo, reason: EndCallReason): void
 }
@@ -244,19 +302,13 @@ export class WaCallMediaSession {
     private readonly answeredRelays = new Map<string, number | undefined>()
     /** Set once setup first asks for our `<relaylatency>`; a relay answering later is named then. */
     private relayLatencyOpened = false
-    /** The peer's last `latency` per relay name, as sent; kept for the relay election, unused yet. */
-    private readonly peerRelayLatencies = new Map<string, number>()
-    private peerRelayLatencyReports = 0
 
     /** The SSRC lists of the plan as last derived; published whole as `ssrcs` on any change. */
     private selfStreamSsrcs: number[] = []
     private peerAudioSsrc = 0
     private peerStreamSsrcs: number[] = []
     private peerVideoStreamSsrcs: number[] = []
-    /**
-     * App-data SSRCs of the peer's devices: inbound app data is recognized by SSRC,
-     * never by payload type, which nothing negotiates.
-     */
+    /** App-data SSRCs of the peer's devices: inbound app data is recognized by SSRC alone. */
     private readonly peerAppDataSsrcs = new Set<number>()
     /** Bumped when the SRTP keys change, so the media rebuilds its contexts only then. */
     private keyEpoch = 0
@@ -264,59 +316,62 @@ export class WaCallMediaSession {
     /** Last value published per plan section, so an unchanged one is not sent again. */
     private readonly publishedSections = new Map<string, unknown>()
 
-    /**
-     * Our own device jid, as the SSRC derivation takes it: an upgraded call derives a
-     * video SSRC long after the jid was resolved.
-     */
+    /** Our own device jid, as the SSRC derivation takes it. */
     private selfDeviceJid = ''
     /** Whether {@link ensureVideoReceivePath} ran; a call negotiated as video never sets it. */
     private videoReceivePathOpened = false
-    /**
-     * Whether an accepted upgrade opened the local video sender on a call negotiated as
-     * audio. Until it does the media drops every video frame: no video RTP leaves before
-     * the peer has accepted.
-     */
+    /** Whether an accepted upgrade opened our video sender on a call negotiated as audio. */
     private videoSendPathOpened = false
-    /**
-     * Holds our video until the peer can take it: after an accepted peer upgrade, and from the
-     * accept on a call born as video. Published as `video.sendHeld`.
-     */
+    /** Holds our video until the peer can take it; published as `video.sendHeld`. */
     private readonly peerVideoReadyGate: WaPeerVideoReadyGate
     /** Whether the one post-active `<mute_v2>` declaration has gone out. */
     private initialMuteAnnounced = false
-    /**
-     * Our counter behind `transaction-id` on the `<video>` messages we send. Starts at 0
-     * so the first one sent is 1, the way the peer numbers its own.
-     */
+    /** Our counter behind `transaction-id` on the `<video>` we send; the first one is 1. */
     private videoStateTransactionId = 0
     /** The upgrade request this side sent and is still waiting on, or `null`. */
     private pendingVideoUpgrade: PendingVideoUpgrade | null = null
-    /**
-     * Whether the peer has an upgrade request outstanding against us, cleared by
-     * anything that ends it, ours or its own.
-     */
+    /** Whether the peer has an upgrade request outstanding against us. */
     private peerVideoUpgradeRequested = false
-    /**
-     * Counts the `<video>` messages from the peer this session has acted on, so an answer
-     * that fails to send can tell whether the request it was answering is still the peer's
-     * latest word. Sending yields, and a withdrawal arriving in that gap must not be undone
-     * by the rollback of the send it raced.
-     */
+    /** Counts the peer's `<video>` acted on, so a failed answer can tell whether it raced one. */
     private peerVideoStateSeen = 0
 
     private acceptedByJid: string | null = null
-    /**
-     * Off unless the call's profile turns it on, which is how the reference client reads
-     * the same key: with it off a repeated transaction id is counted and logged, and the
-     * message is then handled like any other.
-     */
+    /** Whether our camera is on in a group call; `null` follows the call's media type. */
+    private groupVideoSend: boolean | null = null
+    /** Whether the server's `<av_upgrade>` turned this group call into a video call. */
+    private groupVideoUpgraded = false
+    /** Video subscriptions the app set, in place of the policy's; `null` for the policy. */
+    private videoSubscriptionOverride: readonly WaCallMediaVideoSubscription[] | null = null
+    private videoSubscriptions: readonly WaCallMediaVideoSubscription[] = []
+    private videoSubscriptionsChangedAt: number | null = null
+    private videoSubscriptionTimer: ReturnType<typeof setTimeout> | null = null
+    /** Since when we have been waiting on each connected group sender's media, by device. */
+    private readonly senderWaitingSince = new Map<string, number>()
+    private readonly invisibleReported = new Set<string>()
+    private invisibleSweep: ReturnType<typeof setInterval> | null = null
+    private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+    private readonly now: () => number
+    /** The relays a `group_update` moved the call to, published in place of the offer's. */
+    private adoptedRelays: WaCallMediaRelays | null = null
+    private relayGeneration = 0
+    /** The `transaction-id` of the newest `group_update` whose `<relay>` was read. */
+    private relayTransactionId: number | null = null
+    /** The highest `transaction-id` whose rekey this side ran; ordered apart from rosters. */
+    private lastHonouredRekeyTransactionId: number | null = null
+    /** Whether a repeated `<video>` transaction id is dropped rather than only logged. */
     private videoStateTxnEnforced = false
+    private readonly derivations: WaCallDerivations
+    /** Account keys of roster entries, which are replaced whole and never mutated. */
+    private readonly accountKeys = new WeakMap<WaCallGroupParticipant, string>()
+    private selfKeyOf: { readonly jid: string; readonly key: string } | null = null
 
     constructor(options: WaCallMediaSessionOptions) {
         this.deps = options.deps
         this.logger = options.logger
         this.info = options.info
         this.delegate = options.delegate
+        this.now = options.now ?? (() => performance.now())
+        this.derivations = new WaCallDerivations(options.info.callId)
         this.peerVideoReadyGate = new WaPeerVideoReadyGate(
             (reason, trigger, heldMs) => this.releaseVideoSend(reason, trigger, heldMs),
             options.now
@@ -325,17 +380,85 @@ export class WaCallMediaSession {
             onActive: () => this.onMediaActive(),
             onRelayLost: (reason) => this.onRelayLost(reason),
             onRelayAnswered: (name, rttMs) => this.onRelayAnswered(name, rttMs),
-            onReaction: (reaction) => this.delegate.emitCallReaction?.(this.info, reaction),
+            onReaction: (reaction, senderId) =>
+                this.delegate.emitCallReaction?.(this.info, reaction, this.senderJidOf(senderId)),
             onInboundAudio: (pcm) => this.delegate.emitInboundAudio(this.info, pcm),
-            onInboundVideoRtp: (packet) => this.delegate.emitInboundVideoRtp(this.info, packet),
-            onInboundVideo: (frame) => this.delegate.emitInboundVideo(this.info, frame),
+            wantsInboundAudio: () => this.delegate.wantsInboundAudio?.() ?? true,
+            onInboundVideoRtp: (packet) =>
+                this.delegate.emitInboundVideoRtp(
+                    this.info,
+                    packet,
+                    this.senderJidOf(packet.senderId)
+                ),
+            onInboundVideo: (frame) =>
+                this.delegate.emitInboundVideo(this.info, frame, this.senderJidOf(frame.senderId)),
             onOutboundAudioFinished: () => this.delegate.emitOutboundAudioFinished(this.info),
-            onPlan: (message) => this.delegate.emitMediaPlan?.(this.info, message)
+            onPlan: (message) => this.delegate.emitMediaPlan?.(this.info, message),
+            onError: (error) => this.delegate.emitError?.(this.info, error),
+            onSenderMedia: (senderId, receiving) => this.handleSenderMedia(senderId, receiving),
+            // Only when something listens: every frame of every sender is copied.
+            ...(this.delegate.emitParticipantAudio && {
+                onSenderAudio: (senderId: string, pcm: Float32Array) => {
+                    const participantJid = this.info.groupSenders.get(senderId)
+                    if (participantJid) {
+                        this.delegate.emitParticipantAudio?.(this.info, participantJid, pcm)
+                    }
+                }
+            })
         })
     }
 
     get callId(): string {
         return this.info.callId
+    }
+
+    private get isGroupCall(): boolean {
+        return this.info.isGroupCall
+    }
+
+    /** Where our in-call stanzas go: the call itself on a group call, else the answering device. */
+    private inCallTarget(): string {
+        return this.isGroupCall
+            ? toCallServerJid(this.info.callId)
+            : (this.acceptedByJid ?? this.info.peerJid)
+    }
+
+    /** The media entry of a device, created on first sight; `null` once tracking is full. */
+    private participantEntry(deviceJid: string): WaCallParticipantMedia | null {
+        const media = this.info.participantMedia
+        const existing = media.get(deviceJid)
+        if (existing) return existing
+        if (media.size >= MAX_TRACKED_PARTICIPANT_MEDIA) {
+            this.logger.debug('participant media tracking full, state dropped', {
+                callId: this.info.callId,
+                participantJid: deviceJid
+            })
+            return null
+        }
+        const entry: WaCallParticipantMedia = { deviceJid }
+        media.set(deviceJid, entry)
+        return entry
+    }
+
+    /**
+     * The device a media event came from: its sender's on a group call, the answering device on
+     * a 1:1 call, `undefined` when a group sender is unknown.
+     */
+    private senderJidOf(senderId: string | undefined): string | undefined {
+        if (senderId !== undefined) return this.info.groupSenders.get(senderId)
+        if (this.isGroupCall) return undefined
+        return this.toAddressedJid(this.acceptedByJid ?? this.info.peerJid)
+    }
+
+    /** Forgets a device that left the call: its media state, and a hand it still had up. */
+    private forgetParticipantDevice(deviceJid: string): void {
+        const key = this.toAddressedJid(deviceJid)
+        this.info.participantMedia.delete(key)
+        this.senderWaitingSince.delete(key)
+        this.invisibleReported.delete(groupParticipantAccountKey(deviceJid))
+        if (this.info.raisedHands.delete(key)) {
+            this.delegate.emitHandRaise(this.info, key, false)
+        }
     }
 
     /**
@@ -348,13 +471,13 @@ export class WaCallMediaSession {
             reason === 'accepted_elsewhere' &&
             peerJid &&
             this.acceptedByJid &&
-            !this.isSameDevice(peerJid, this.acceptedByJid)
+            !isSameDeviceJid(peerJid, this.acceptedByJid)
         )
     }
 
     async initMedia(selfLid: string, peerJid: string): Promise<void> {
-        const selfDeviceJid = this.ensureDeviceJid(selfLid)
-        const peerDeviceJid = this.ensureDeviceJid(peerJid)
+        const selfDeviceJid = toDeviceJid(selfLid)
+        const peerDeviceJid = toDeviceJid(peerJid)
         this.selfDeviceJid = selfDeviceJid
         const relaySlots = this.relaySlots
         this.selfStreamSsrcs = relaySlots.map((slot) => this.ssrcOf(selfDeviceJid, slot))
@@ -363,14 +486,14 @@ export class WaCallMediaSession {
             const peerBase = toUserJid(peerJid)
             const peerDevices = (this.info.relayData?.participantJids || [])
                 .filter((jid) => toUserJid(jid) === peerBase)
-                .map((jid) => this.ensureDeviceJid(jid))
+                .map((jid) => toDeviceJid(jid))
             this.peerStreamSsrcs = this.audioStreamsOf([peerDeviceJid, ...peerDevices])
             this.trackPeerAppDataSsrcs([peerDeviceJid, ...peerDevices])
         } else {
             this.trackPeerAppDataSsrcs([peerDeviceJid])
         }
         this.peerAudioSsrc = this.peerStreamSsrcs[0]
-        this.peerVideoStreamSsrcs = this.peerVideoStreamsOf(this.ensureDeviceJid(this.info.peerJid))
+        this.peerVideoStreamSsrcs = this.peerVideoStreamsOf(toDeviceJid(this.info.peerJid))
 
         this.logger.debug('call media initialized', {
             callId: this.info.callId,
@@ -387,28 +510,19 @@ export class WaCallMediaSession {
     }
 
     /**
-     * Stores the configuration that came in the offer and hands the media what it
-     * tunes: the REMB gate, the RTCP interval, the app-data SFrame flag and the audio
-     * frames per packet. Called
-     * again mid-call for the larger profile that rides an upgrade request.
-     *
-     * `null` is not an error, it is the common case of an absent or unreadable
-     * node, and it leaves the call exactly as it was.
+     * Stores the call's `<voip_settings>` and hands the media what it tunes; again mid-call for
+     * the profile an upgrade request carries. `null`, an absent or unreadable node, changes nothing.
      */
     applyVoipSettings(settings: WaVoipSettings | null): void {
         if (!settings) return
 
         this.info.voipSettings = settings
-        this.videoStateTxnEnforced = settings.getFlag(
-            VOIP_SETTINGS_OPTIONS_SECTION,
-            VIDEO_STATE_TXN_RECV_ENFORCE_KEY,
-            false
-        )
+        this.videoStateTxnEnforced = settings.videoStateTxnRecvEnforce
 
         const section: WaCallMediaSettings = {
             rtcpIntervalMs: settings.rtcpIntervalMs,
             disableRtcpRemb: settings.disableRtcpRemb,
-            appDataSframe: resolveAppDataSframe(settings),
+            appDataSframe: settings.sframe && settings.sframeRx,
             audioFramesPerPacket: resolveAudioFramesPerPacket(settings)
         }
         void this.publish({ settings: section })
@@ -419,24 +533,11 @@ export class WaCallMediaSession {
             disableRtcpRemb: section.disableRtcpRemb,
             rtcpIntervalMs: section.rtcpIntervalMs,
             audioFramesPerPacket: section.audioFramesPerPacket,
-            appDataStream: settings.getFlag(
-                VOIP_SETTINGS_OPTIONS_SECTION,
-                ENABLE_APP_DATA_STREAM_KEY,
-                false
-            ),
-            appDataStreamVersion: settings.getNumber(
-                VOIP_SETTINGS_OPTIONS_SECTION,
-                APP_DATA_STREAM_VERSION_KEY,
-                0
-            ),
-            sframe: settings.getFlag(VOIP_SETTINGS_SFRAME_SECTION, ENABLE_SFRAME_KEY, false),
-            sframeRx: settings.getFlag(VOIP_SETTINGS_SFRAME_SECTION, ENABLE_SFRAME_RX_KEY, false)
+            appDataStream: settings.appDataStream,
+            appDataStreamVersion: settings.appDataStreamVersion,
+            sframe: settings.sframe,
+            sframeRx: settings.sframeRx
         })
-    }
-
-    resetOutgoingFlags(): void {
-        this.initialTransportSent = false
-        this.outgoingPreacceptSent = false
     }
 
     async acceptCall(): Promise<void> {
@@ -449,7 +550,6 @@ export class WaCallMediaSession {
         this.info.applyTransition({ type: 'local_accepted' })
         this.delegate.emitState(this.info)
 
-        const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? ''
         const callId = this.info.callId
         const callCreator = this.info.callCreator
         const peerJid = this.info.peerJid
@@ -458,38 +558,30 @@ export class WaCallMediaSession {
         if (isVideo) this.holdBornVideoSend()
 
         // The offer's sender (a bare jid is device 0), not a companion from participantJids.
-        const acceptedPeerDeviceJid = this.ensureDeviceJid(peerJid)
+        const acceptedPeerDeviceJid = toDeviceJid(peerJid)
         this.acceptedByJid = acceptedPeerDeviceJid
         this.peerAudioSsrc = this.ssrcOf(acceptedPeerDeviceJid)
         this.peerVideoStreamSsrcs = this.peerVideoStreamsOf(acceptedPeerDeviceJid)
         await this.publishSsrcsAndKeys(this.deriveKeys())
 
-        try {
-            const transportNode = buildTransportStanza(peerJid, callId, callCreator, meId, '1', '1')
-            await this.deps.lowLevelCoordinator.sendNode(transportNode)
-        } catch (err: unknown) {
-            this.logger.error('error sending transport', {
-                message: toError(err).message
-            })
-        }
+        await this.sendLogged(
+            () => buildTransportStanza(peerJid, callId, callCreator, '1', '1'),
+            'error sending transport'
+        )
 
-        if (this.info.encryptionKey) {
+        // A group offer carries no key: it arrives over `enc_rekey` once the accept is in.
+        if (this.info.encryptionKey || this.isGroupCall) {
             const acceptStanza = await buildAcceptStanza(
                 this.deps,
                 this.info.callId,
                 this.info.peerJid,
                 this.info.callCreator,
-                isVideo
+                isVideo,
+                this.isGroupCall
             )
-
-            try {
-                await this.deps.lowLevelCoordinator.sendNode(acceptStanza)
-            } catch (err: unknown) {
-                this.logger.error('accept send error', {
-                    message: toError(err).message
-                })
-            }
+            await this.sendLogged(() => acceptStanza, 'accept send error')
         }
+        this.startHeartbeat()
 
         await this.publish({ relays: this.relaysSection(), accepted: true })
 
@@ -500,47 +592,59 @@ export class WaCallMediaSession {
         this.info.applyTransition({ type: 'local_rejected', reason })
         this.delegate.emitState(this.info)
 
-        const node = buildRejectStanza(this.info.peerJid, this.info.callId, this.info.callCreator)
-        try {
-            await this.deps.lowLevelCoordinator.sendNode(node)
-        } catch (err) {
-            this.logger.warn('reject send failed', { message: toError(err).message })
-        }
+        const node = buildRejectStanza(
+            this.info.peerJid,
+            this.info.callId,
+            this.info.callCreator,
+            this.isGroupCall
+        )
+        await this.sendLogged(() => node, 'reject send failed', 'warn')
         this.cleanup()
     }
 
+    /** Ends the call; on a group call only this side leaves, as {@link leaveCall}. */
     async endCall(reason: EndCallReason = EndCallReason.UserEnded): Promise<void> {
         if (this.info.isEnded) return
+        await this.terminate(reason, undefined)
+    }
 
+    /**
+     * Leaves a group call the others stay on: one reason-less terminate to the call itself.
+     * @throws on a call that is no group's.
+     */
+    async leaveCall(reason: EndCallReason = EndCallReason.UserEnded): Promise<void> {
+        if (!this.isGroupCall) {
+            throw new Error(`call ${this.info.callId} is not a group call, end it instead`)
+        }
+        if (this.info.isEnded) return
+        await this.terminate(reason, undefined)
+    }
+
+    /** The terminate of this call: to the call itself on a group call, else the answering device. */
+    buildTerminateStanza(audioDurationMs?: number, wireReason?: string): BinaryNode {
+        return buildTerminateStanza(
+            this.inCallTarget(),
+            this.info.callId,
+            this.info.callCreator,
+            audioDurationMs,
+            wireReason
+        )
+    }
+
+    private async terminate(reason: EndCallReason, wireReason: string | undefined): Promise<void> {
         const connectedAt = this.info.stateData.connectedAt
         const audioDurationMs = connectedAt ? Date.now() - connectedAt.getTime() : undefined
 
         this.info.applyTransition({ type: 'terminated', reason })
 
-        const terminateTarget = this.acceptedByJid ?? this.info.peerJid
-        const node = buildTerminateStanza(
-            terminateTarget,
-            this.info.callId,
-            this.info.callCreator,
-            audioDurationMs
-        )
+        const node = this.buildTerminateStanza(audioDurationMs, wireReason)
         this.delegate.emitEnded(this.info)
         this.delegate.emitState(this.info)
-        try {
-            await this.deps.lowLevelCoordinator.sendNode(node)
-        } catch (err) {
-            this.logger.warn('terminate send failed', { message: toError(err).message })
-        }
+        await this.sendLogged(() => node, 'terminate send failed', 'warn')
         this.cleanup()
     }
 
-    /**
-     * Mutes or unmutes our own capture and announces it to the peer.
-     *
-     * Muting stays local: the media keeps sending silence, so the stream and its SSRC
-     * stay alive. A no-op toggle sends nothing; the once-per-call declaration a
-     * starting call needs is {@link announceInitialMuteState}.
-     */
+    /** Mutes our capture and announces it; the media keeps sending silence on the same SSRC. */
     setMute(muted: boolean): void {
         if (!this.info.isActive) return
         if (this.info.stateData.audioMuted === muted) return
@@ -549,58 +653,28 @@ export class WaCallMediaSession {
         this.delegate.emitState(this.info)
 
         void this.publish({ muted })
-
-        // Fire-and-forget: the microphone is already off and a failed send is only logged.
-        const node = buildMuteV2Stanza(
-            this.acceptedByJid ?? this.info.peerJid,
-            this.info.callId,
-            this.info.callCreator,
+        this.sendDetached(this.muteV2Stanza(muted), 'mute_v2 announcement failed', 'warn', {
             muted
-        )
-        void this.deps.lowLevelCoordinator.sendNode(node).catch((err) => {
-            this.logger.warn('mute_v2 announcement failed', {
-                muted,
-                message: toError(err).message
-            })
         })
     }
 
-    /**
-     * Announces this side's microphone state once, just after the call goes active.
-     * Measured on the wire: both ends of a reference call send it. Without it the peer
-     * has nothing to show for this side until the first toggle, which on a call that is
-     * never muted never comes. Fire-and-forget, sent once.
-     */
+    /** Announces our microphone state once the call is active; the peer shows nothing until then. */
     private announceInitialMuteState(): void {
         if (this.initialMuteAnnounced) return
         this.initialMuteAnnounced = true
-
-        const node = buildMuteV2Stanza(
-            this.acceptedByJid ?? this.info.peerJid,
-            this.info.callId,
-            this.info.callCreator,
-            this.info.stateData.audioMuted
+        this.sendDetached(
+            this.muteV2Stanza(this.info.stateData.audioMuted),
+            'initial mute_v2 announcement failed'
         )
-        void this.deps.lowLevelCoordinator.sendNode(node).catch((err) => {
-            this.logger.warn('initial mute_v2 announcement failed', {
-                callId: this.info.callId,
-                message: toError(err).message
-            })
-        })
     }
 
-    /**
-     * Raises or lowers the local hand and announces it to the peer. Idempotent.
-     *
-     * The local state moves only after the stanza leaves, so a failed send cannot leave
-     * this side believing the peer saw a hand that never arrived; the error is rethrown.
-     */
+    /** Raises or lowers our hand; the state moves only once the stanza left, else it rethrows. */
     async setHandRaised(raised: boolean): Promise<void> {
         if (!this.info.isActive) return
         if (this.info.stateData.handRaised === raised) return
 
         const node = buildRaiseHandStanza(
-            this.acceptedByJid ?? this.info.peerJid,
+            this.inCallTarget(),
             this.info.callId,
             this.info.callCreator,
             raised
@@ -620,30 +694,22 @@ export class WaCallMediaSession {
         this.delegate.emitState(this.info)
     }
 
+    /** `screen_share_id` of the last start or stop sent; each one sent takes the next. */
+    private screenShareId = 0
+
     /**
-     * Starts or stops sharing the screen on this call, and tells the peer. The share is not
-     * a stream of its own: the screen rides the video stream the call already has, so this
-     * only changes what the peer is told the picture *is*, and switching the content is the
-     * caller's job. Idempotent, and a no-op on an inactive call.
-     *
-     * @throws when the send fails, leaving the state untouched, and - starting a share
-     * only - on a group call or on a call carrying no video yet
-     * ({@link requestVideoUpgrade} first).
+     * Tells the peer our video stream now carries the screen, or no longer; feeding it is the
+     * caller's job. @throws when the send fails, or to start one on a call with no video yet.
      */
     async setScreenShare(sharing: boolean): Promise<void> {
         if (!this.info.isActive) return
         if (this.info.stateData.screenSharing === sharing) return
 
-        if (sharing) {
-            if (this.info.groupJid) {
-                throw new Error(`Call ${this.info.callId} is a group call, which cannot be shared`)
-            }
-            if (!this.videoSendActive) {
-                throw new Error(`Call ${this.info.callId} carries no video to share the screen on`)
-            }
+        if (sharing && !this.videoSendActive) {
+            throw new Error(`Call ${this.info.callId} carries no video to share the screen on`)
         }
 
-        const peerDeviceJid = this.acceptedByJid ?? this.info.peerJid
+        const peerDeviceJid = this.inCallTarget()
         const state = sharing ? WA_SCREEN_SHARE_STATE.Started : WA_SCREEN_SHARE_STATE.Stopped
 
         try {
@@ -652,7 +718,8 @@ export class WaCallMediaSession {
                     peerDeviceJid,
                     this.info.callId,
                     this.info.callCreator,
-                    state
+                    state,
+                    ++this.screenShareId
                 )
             )
         } catch (err) {
@@ -688,7 +755,9 @@ export class WaCallMediaSession {
         return this.media.feedLiveAudio(data)
     }
 
+    /** `0` with our group camera off: nothing leaves after the `<video state='6'>`. */
     feedLiveVideo(data: Uint8Array, timestampUs: number): number {
+        if (this.isGroupCall && !this.groupVideoSending) return 0
         return this.media.sendVideoFrame(data, timestampUs)
     }
 
@@ -696,19 +765,18 @@ export class WaCallMediaSession {
         return this.media.getLiveBufferMs()
     }
 
+    /** A group callee preaccepts to the call itself, which is where its capability goes. */
     async sendIncomingPreaccept(peerJid: string): Promise<void> {
-        try {
-            const preacceptNode = buildPreacceptStanza(
-                peerJid,
-                this.info.callId,
-                this.info.callCreator
-            )
-            await this.deps.lowLevelCoordinator.sendNode(preacceptNode)
-        } catch (err: unknown) {
-            this.logger.error('error sending preaccept', {
-                message: toError(err).message
-            })
-        }
+        await this.sendLogged(
+            () =>
+                buildPreacceptStanza(
+                    peerJid,
+                    this.info.callId,
+                    this.info.callCreator,
+                    this.isGroupCall
+                ),
+            'error sending preaccept'
+        )
     }
 
     /**
@@ -720,30 +788,26 @@ export class WaCallMediaSession {
         this.relayLatencyOpened = true
         if (!this.info.relayData) return
 
-        const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? ''
         const destinationJids = this.info.relayData.participantJids || []
 
         for (const relay of this.dialableRelayLatencies()) {
             if (this.info.isEnded) return
             if (this.announcedRelayNames.has(relay.relayName)) continue
             this.announcedRelayNames.add(relay.relayName)
-            try {
-                const relayLatencyNode = buildRelayLatencyStanza(
-                    this.info.peerJid,
-                    this.info.callId,
-                    this.info.callCreator,
-                    [relay],
-                    destinationJids,
-                    meId
-                )
-                await this.deps.lowLevelCoordinator.sendNode(relayLatencyNode)
-            } catch (err: unknown) {
-                this.announcedRelayNames.delete(relay.relayName)
-                this.logger.error('error sending relaylatency', {
-                    relayName: relay.relayName,
-                    message: toError(err).message
-                })
-            }
+            const sent = await this.sendLogged(
+                () =>
+                    buildRelayLatencyStanza(
+                        this.info.peerJid,
+                        this.info.callId,
+                        this.info.callCreator,
+                        [relay],
+                        destinationJids
+                    ),
+                'error sending relaylatency',
+                'error',
+                { relayName: relay.relayName }
+            )
+            if (!sent) this.announcedRelayNames.delete(relay.relayName)
         }
     }
 
@@ -781,10 +845,17 @@ export class WaCallMediaSession {
     }
 
     /**
-     * On an incoming call only another device of this account can accept: that ends it while
-     * ringing, as accepted elsewhere, sending nothing. An accept from any other account is dropped.
+     * An `<accept>`: the peer answering a 1:1 call we placed, a group participant joining, or on
+     * an incoming 1:1 call another device of this account, which ends our ring.
      */
     async handleCallAccept(node: BinaryNode, peerJid: string): Promise<void> {
+        if (
+            this.isGroupCall &&
+            (this.info.direction === CallDirection.Outgoing || !this.isOwnAccountJid(peerJid))
+        ) {
+            this.handleGroupAccept(peerJid)
+            return
+        }
         if (this.info.direction === CallDirection.Incoming) {
             if (!this.isOwnAccountJid(peerJid)) {
                 this.logger.warn('accept from another account on an incoming call, ignored', {
@@ -802,12 +873,9 @@ export class WaCallMediaSession {
 
         const answering = this.readAnsweringDevice(nodeInfo.innerNode, peerJid)
         const acceptingDeviceJid = answering.jid
-        const acceptedPeerDeviceJid = this.ensureDeviceJid(acceptingDeviceJid)
+        const acceptedPeerDeviceJid = toDeviceJid(acceptingDeviceJid)
 
-        /**
-         * A call we offered as video holds our video from the peer's accept: before anything
-         * yields, and only while ringing, so a repeated accept cannot undo a release.
-         */
+        // Held before anything yields, and only while ringing: a repeated accept cannot undo a release.
         if (
             this.info.stateData.state === CallState.Ringing &&
             this.info.mediaType === CallMediaType.Video
@@ -831,24 +899,11 @@ export class WaCallMediaSession {
                         ? uint8TimingSafeEqual(ourCallKey, peerCallKey)
                         : false
                     if (!keysMatch && ourCallKey) {
-                        const meLid = this.deps.authClient.getCurrentCredentials()?.meLid
-                        const meJid = this.deps.authClient.getCurrentCredentials()?.meJid
-                        const ourCredJid = meLid || meJid || ''
-                        const ourBase = ourCredJid ? toUserJid(ourCredJid) : ''
-                        const participants = this.info.relayData?.participantJids || []
-                        const ourDeviceJid =
-                            participants.find((jid) => {
-                                const jBase = toUserJid(jid)
-                                return jBase === ourBase && /:\d+@/.test(jid)
-                            }) || ourCredJid
-
+                        const ourDeviceJid = this.ourRelayDeviceJid()
                         if (ourDeviceJid) {
                             try {
                                 keys = this.versionKeys(
-                                    derivePerJidSrtpKey(
-                                        ourCallKey,
-                                        this.ensureDeviceJid(ourDeviceJid)
-                                    ),
+                                    derivePerJidSrtpKey(ourCallKey, toDeviceJid(ourDeviceJid)),
                                     derivePerJidSrtpKey(peerCallKey, acceptedPeerDeviceJid)
                                 )
                                 this.logger.debug('srtp re-initialized with peer call_key', {
@@ -876,9 +931,7 @@ export class WaCallMediaSession {
             this.logger.trace('call transition skipped', { message: toError(err).message })
         }
 
-        const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? ''
-        const meLid = this.deps.authClient.getCurrentCredentials()?.meLid
-        const ourJid = meLid || meId
+        const ourJid = selfJidOf(this.deps)
         const ourBase = ourJid ? toUserJid(ourJid) : ''
         const callId = this.info.callId
         const callCreator = this.info.callCreator
@@ -888,7 +941,7 @@ export class WaCallMediaSession {
             this.info.relayData.peerPid = answering.pid
         }
 
-        /** A stream of the peer already seen on the wire outranks this, and the media keeps it. */
+        // A stream of the peer already seen on the wire outranks this, and the media keeps it.
         this.peerAudioSsrc = this.ssrcOf(acceptedPeerDeviceJid)
         this.logger.debug('accept ssrc assigned', {
             callId,
@@ -902,7 +955,7 @@ export class WaCallMediaSession {
             const peerBase = toUserJid(acceptingDeviceJid)
             const peerDevices = (this.info.relayData?.participantJids || [])
                 .filter((jid) => toUserJid(jid) === peerBase)
-                .map((jid) => this.ensureDeviceJid(jid))
+                .map((jid) => toDeviceJid(jid))
             this.peerStreamSsrcs = this.audioStreamsOf([acceptedPeerDeviceJid, ...peerDevices])
             this.trackPeerAppDataSsrcs([acceptedPeerDeviceJid, ...peerDevices])
         } else {
@@ -913,7 +966,7 @@ export class WaCallMediaSession {
 
         if (this.info.relayData?.participantJids) {
             const otherDevices = this.info.relayData.participantJids.filter((jid) => {
-                if (this.isSameDevice(jid, acceptingDeviceJid)) return false
+                if (isSameDeviceJid(jid, acceptingDeviceJid)) return false
                 const jidBase = toUserJid(jid)
                 if (jidBase === ourBase) return false
                 return true
@@ -938,82 +991,94 @@ export class WaCallMediaSession {
             }
         }
 
-        try {
-            const transportNode = buildTransportStanza(
-                acceptingDeviceJid,
-                callId,
-                callCreator,
-                meId,
-                '1',
-                '1'
-            )
-            await this.deps.lowLevelCoordinator.sendNode(transportNode)
-        } catch (err: unknown) {
-            this.logger.error('error sending transport', {
-                message: toError(err).message
-            })
-        }
+        await this.sendLogged(
+            () => buildTransportStanza(acceptingDeviceJid, callId, callCreator, '1', '1'),
+            'error sending transport'
+        )
 
         const acceptMsgId = node.attrs?.id
         if (acceptMsgId) {
-            try {
-                const receiptNode = buildAcceptReceiptStanza(
-                    acceptingDeviceJid,
-                    acceptMsgId,
-                    callId,
-                    callCreator,
-                    ourJid
-                )
-                await this.deps.lowLevelCoordinator.sendNode(receiptNode)
-            } catch (err: unknown) {
-                this.logger.error('error sending accept receipt', {
-                    message: toError(err).message
-                })
-            }
+            await this.sendLogged(
+                () =>
+                    buildAcceptReceiptStanza(
+                        acceptingDeviceJid,
+                        acceptMsgId,
+                        callId,
+                        callCreator,
+                        ourJid
+                    ),
+                'error sending accept receipt'
+            )
         }
 
         // With a leg up the media starts at once; with none it dials the relays it holds.
         await this.publish({ accepted: true })
     }
 
-    async handleCallPreaccept(node: BinaryNode, peerJid: string): Promise<void> {
-        const nodeInfo = extractNodeInfo(node)
-        if (!nodeInfo) return
-
-        if (this.info.direction === CallDirection.Outgoing && this.info.relayData) {
-            const meId = this.deps.authClient.getCurrentCredentials()?.meJid ?? ''
-            const callId = this.info.callId
-            const callCreator = this.info.callCreator
-
-            await this.sendRelayLatency()
-
-            if (!this.initialTransportSent) {
-                try {
-                    const basePeerJid = toUserJid(peerJid)
-                    const transportNode = buildTransportStanza(
-                        basePeerJid,
-                        callId,
-                        callCreator,
-                        meId
-                    )
-                    await this.deps.lowLevelCoordinator.sendNode(transportNode)
-                    this.initialTransportSent = true
-                } catch (err: unknown) {
-                    this.logger.error('error sending initial transport', {
-                        message: toError(err).message
-                    })
-                }
-            }
+    /** An `<accept>` on a group call; the roster usually connects a call we placed first. */
+    private handleGroupAccept(peerJid: string): void {
+        if (!this.joinPlacedGroupCall('accept')) {
+            this.logger.debug('group accept from a participant', {
+                callId: this.info.callId,
+                from: peerJid
+            })
+            return
         }
+        this.delegate.emitState(this.info)
+        this.startHeartbeat()
+        void this.publish({ accepted: true })
     }
 
     /**
-     * Hands the relays a `<transport>` lists to the media. The media keeps dialling
-     * nothing new while a leg is open, and dials them once the call has none.
+     * Moves a group call we placed out of ringing, once: the first participant joined. The
+     * caller emits the state and publishes `accepted`, which is what starts the media.
      */
-    async handleCallTransport(_node: BinaryNode): Promise<void> {
-        const nodeInfo = extractNodeInfo(_node)
+    private joinPlacedGroupCall(trigger: 'accept' | 'roster'): boolean {
+        if (
+            this.info.direction !== CallDirection.Outgoing ||
+            this.info.stateData.state !== CallState.Ringing
+        ) {
+            return false
+        }
+        this.info.applyTransition({ type: 'remote_accepted' })
+        this.logger.debug('group call joined', { callId: this.info.callId, trigger })
+        return true
+    }
+
+    /** Whether the roster lists somebody but us connected. */
+    private hasOtherParticipantConnected(): boolean {
+        const selfKey = this.selfAccountKey()
+        return (this.info.groupComposition?.participants ?? []).some(
+            (participant) =>
+                participant.state === WA_CALL_PARTICIPANT_STATE.Connected &&
+                this.accountKeyOf(participant) !== selfKey
+        )
+    }
+
+    async handleCallPreaccept(node: BinaryNode, peerJid: string): Promise<void> {
+        if (!extractNodeInfo(node)) return
+        if (this.info.direction !== CallDirection.Outgoing || !this.info.relayData) return
+
+        await this.sendRelayLatency()
+        if (this.initialTransportSent) return
+        this.initialTransportSent = await this.sendLogged(
+            () => buildTransportStanza(toUserJid(peerJid), this.info.callId, this.info.callCreator),
+            'error sending initial transport'
+        )
+    }
+
+    /**
+     * Hands the relays a `<transport>` lists to the media, dialled once the call has no leg; on
+     * a group call its `<relay>` is followed like a reissue.
+     */
+    async handleCallTransport(node: BinaryNode): Promise<void> {
+        const nodeInfo = extractNodeInfo(node)
         if (!nodeInfo) return
+
+        if (this.isGroupCall) {
+            await this.adoptReissuedRelays(nodeInfo.innerNode, null)
+            return
+        }
 
         const relays = extractRelayEndpoints(nodeInfo.innerNode)
         if (relays.length === 0) return
@@ -1027,69 +1092,56 @@ export class WaCallMediaSession {
 
     async handleCallAck(node: BinaryNode): Promise<void> {
         const ackType = node.attrs?.type
+        // A re-rung group offer comes with no relay: the ack of our accept may bring it.
+        if (ackType === 'accept' && this.isGroupCall) {
+            await this.adoptReissuedRelays(node, null)
+            return
+        }
         if (ackType !== 'offer') return
 
         const error = node.attrs?.error
         if (error) {
-            this.logger.error('ack error', { callId: this.info.callId, error })
+            this.logger.warn('offer refused by the server, call ended', {
+                callId: this.info.callId,
+                error
+            })
+            if (!this.info.isEnded) {
+                await this.terminate(EndCallReason.SetupFailed, SETUP_FAILED_REASON)
+            }
             return
         }
 
-        /**
-         * A repeat delivery of this ack carries the same ~34 KB base64+JSON payload:
-         * applying it twice is harmless, decoding it twice is not free. The skip is for
-         * that repeat alone. The other profile the server ships, the larger video one,
-         * does reach a call mid-flight - it rides the upgrade request and is applied
-         * where that is read, not here.
-         */
+        // A repeated ack carries the same settings, costly to decode again.
         if (!this.info.voipSettings) {
             this.applyVoipSettings(parseVoipSettings(node, this.logger))
         }
 
-        const { relays, participantJids, uuid, selfPid, peerPid, hbhKey } = parseRelayFromAck(node)
+        const relayData = parseRelayFromAck(node)
+        const { endpoints, participantJids } = relayData
+        if (endpoints.length === 0 || this.adoptedRelays) return
 
-        if (relays.length === 0) return
-
-        this.info.relayData = {
-            endpoints: relays,
-            participantJids,
-            uuid,
-            selfPid,
-            peerPid,
-            hbhKey
-        }
+        this.info.relayData = relayData
 
         this.logger.debug('offer ack relays parsed', {
             callId: this.info.callId,
-            relayCount: relays.length,
+            relayCount: endpoints.length,
             participantCount: participantJids.length
         })
 
         if (participantJids.length > 0) {
-            const meLid = this.deps.authClient.getCurrentCredentials()?.meLid
-            const meId = this.deps.authClient.getCurrentCredentials()?.meJid
-            const ourCredJid = meLid || meId || ''
-            const ourBase = ourCredJid ? toUserJid(ourCredJid) : ''
-
-            const ourDeviceJid = this.ensureDeviceJid(
-                participantJids.find((jid) => {
-                    const jidBase = toUserJid(jid)
-                    return jidBase === ourBase && /:\d+@/.test(jid)
-                }) || ourCredJid
-            )
+            const ourJid = selfJidOf(this.deps)
+            const ourBase = ourJid ? toUserJid(ourJid) : ''
+            const ourDeviceJid = toDeviceJid(this.ourRelayDeviceJid())
             this.selfDeviceJid = ourDeviceJid
 
-            /**
-             * Until an accept names the answering device, every device of the peer is
-             * subscribed and none is taken for the answering one.
-             */
+            // Until an accept names the answering device, every device of the peer is subscribed.
             const peerDevices = this.acceptedByJid
-                ? [this.ensureDeviceJid(this.acceptedByJid)]
+                ? [toDeviceJid(this.acceptedByJid)]
                 : Array.from(
                       new Set(
                           participantJids
                               .filter((jid) => toUserJid(jid) !== ourBase)
-                              .map((jid) => this.ensureDeviceJid(jid))
+                              .map((jid) => toDeviceJid(jid))
                       )
                   )
 
@@ -1124,20 +1176,16 @@ export class WaCallMediaSession {
             await this.publishSsrcsAndKeys(keys)
         }
 
-        if (this.info.isInitiator && !this.outgoingPreacceptSent) {
-            try {
-                const preacceptNode = buildPreacceptStanza(
-                    this.info.peerJid,
-                    this.info.callId,
-                    this.info.callCreator
-                )
-                await this.deps.lowLevelCoordinator.sendNode(preacceptNode)
-                this.outgoingPreacceptSent = true
-            } catch (err: unknown) {
-                this.logger.error('error sending preaccept (caller)', {
-                    message: toError(err).message
-                })
-            }
+        if (this.info.isInitiator && !this.outgoingPreacceptSent && !this.isGroupCall) {
+            this.outgoingPreacceptSent = await this.sendLogged(
+                () =>
+                    buildPreacceptStanza(
+                        this.info.peerJid,
+                        this.info.callId,
+                        this.info.callCreator
+                    ),
+                'error sending preaccept (caller)'
+            )
         }
 
         await this.publish({ relays: this.relaysSection() })
@@ -1150,39 +1198,22 @@ export class WaCallMediaSession {
     handleCallRelaylatency(node: BinaryNode, peerJid: string): void {
         const nodeInfo = extractNodeInfo(node)
         if (!nodeInfo) return
-
-        this.peerRelayLatencyReports++
-        for (const te of getNodeChildrenByTag(nodeInfo.innerNode, 'te')) {
-            const name = te.attrs?.relay_name
-            const latency = Number(te.attrs?.latency)
-            if (!name || !Number.isSafeInteger(latency)) continue
-            if (
-                !this.peerRelayLatencies.has(name) &&
-                this.peerRelayLatencies.size >= MAX_TRACKED_PEER_RELAY_LATENCIES
-            ) {
-                continue
-            }
-            this.peerRelayLatencies.set(name, latency)
-        }
-
-        this.logger.trace('peer relay latencies recorded', {
+        this.logger.trace('peer relay latencies received', {
             callId: this.info.callId,
             from: peerJid,
-            reports: this.peerRelayLatencyReports,
-            relays: this.peerRelayLatencies.size
+            relays: getNodeChildrenByTag(nodeInfo.innerNode, 'te').length
         })
     }
 
+    /** Logged only: the media elects its own relay. */
     handleRelayElection(node: BinaryNode): void {
         const inner = getFirstNodeChild(node)
         if (!inner) return
 
         let electedRelayIdx: number | undefined
-        if (inner.attrs?.['elected_relay_idx'] !== undefined) {
-            const parsed = Number(inner.attrs['elected_relay_idx'])
-            if (Number.isSafeInteger(parsed) && parsed >= 0) electedRelayIdx = parsed
-        } else if (inner.attrs?.['relay_id'] !== undefined) {
-            const parsed = Number(inner.attrs['relay_id'])
+        const attr = inner.attrs?.['elected_relay_idx'] ?? inner.attrs?.['relay_id']
+        if (attr !== undefined) {
+            const parsed = Number(attr)
             if (Number.isSafeInteger(parsed) && parsed >= 0) electedRelayIdx = parsed
         } else if (inner.content instanceof Uint8Array) {
             const bytes = inner.content
@@ -1200,15 +1231,8 @@ export class WaCallMediaSession {
     }
 
     /**
-     * Records the microphone state an inbound `<mute_v2>` announces, once per change.
-     * Nothing goes back: it is an announcement, not a request.
-     *
-     * Two are dropped on purpose: one from another device of our own account, whose mute
-     * state is not the peer's, and one carrying `request-state`, a group-call mechanism
-     * WhatsApp's own clients drop on a 1:1 call.
-     *
-     * On a call born as video, the peer's first announcement after the accept is also
-     * the sign that it can take our video; see {@link WaPeerVideoReadyGate}.
+     * Records the microphone state a `<mute_v2>` announces; one from our own account, or a mute
+     * request on a 1:1 call, is dropped. Also the born-video sign of {@link WaPeerVideoReadyGate}.
      */
     handleCallMuteV2(node: BinaryNode, peerJid: string): void {
         const nodeInfo = extractNodeInfo(node)
@@ -1219,9 +1243,14 @@ export class WaCallMediaSession {
             return
         }
 
+        const key = this.toAddressedJid(peerJid)
         const payload = parseMuteV2(nodeInfo.innerNode)
         if (payload.isRequest) {
-            this.logger.debug('ignoring mute request on a 1:1 call', { peerJid })
+            if (!this.isGroupCall) {
+                this.logger.debug('ignoring mute request on a 1:1 call', { peerJid })
+                return
+            }
+            this.handleMuteRequest(payload.requestState ?? '', key)
             return
         }
 
@@ -1233,11 +1262,67 @@ export class WaCallMediaSession {
             return
         }
 
-        if (this.info.stateData.peerAudioMuted === payload.muted) return
+        const entry = this.participantEntry(key)
+        if (this.isGroupCall) {
+            if (!entry || entry.audioMuted === payload.muted) return
+            entry.audioMuted = payload.muted
+        } else {
+            if (this.info.stateData.peerAudioMuted === payload.muted) return
+            this.info.stateData.peerAudioMuted = payload.muted
+            if (entry) entry.audioMuted = payload.muted
+        }
 
-        this.info.stateData.peerAudioMuted = payload.muted
-        this.delegate.emitPeerMute(this.info, payload.muted)
+        this.delegate.emitPeerMute(this.info, payload.muted, key)
         this.delegate.emitState(this.info)
+    }
+
+    /** A participant asked us to mute. Reported, never applied: muting is the app's call. */
+    private handleMuteRequest(requestState: string, participantJid: string): void {
+        this.logger.debug('mute requested by a participant', {
+            callId: this.info.callId,
+            participantJid,
+            requestState
+        })
+        this.delegate.emitMuteRequested?.(this.info, participantJid, requestState)
+    }
+
+    /**
+     * Asks a group participant's device to mute; it decides. An account names its first device.
+     * @throws on a 1:1 call, for somebody not on the call, or when the send fails.
+     */
+    async requestParticipantMute(participantJid: string): Promise<void> {
+        if (!this.isGroupCall) {
+            throw new Error(`Call ${this.info.callId} is not a group call`)
+        }
+        const target = this.participantDeviceOf(participantJid)
+        if (!target) {
+            throw new Error(`${participantJid} is not on call ${this.info.callId}`)
+        }
+        await this.deps.lowLevelCoordinator.sendNode(
+            buildMuteRequestStanza(target, this.info.callId, this.info.callCreator)
+        )
+        this.logger.debug('mute requested of a participant', {
+            callId: this.info.callId,
+            participantJid: target
+        })
+    }
+
+    /** The device a jid names on this call, device 0 bare; an account names its first device. */
+    private participantDeviceOf(jid: string): string | null {
+        const key = groupParticipantAccountKey(jid)
+        const participant = this.info.groupComposition?.participants.find(
+            (entry) => this.accountKeyOf(entry) === key
+        )
+        if (!participant) return null
+        if (toUserJid(jid) === jid) {
+            const first = participant.devices[0]
+            return first ? this.toAddressedJid(first) : null
+        }
+        const wanted = this.toAddressedJid(jid)
+        const device = participant.devices.find(
+            (deviceJid) => this.toAddressedJid(deviceJid) === wanted
+        )
+        return device ? this.toAddressedJid(device) : null
     }
 
     private isOwnAccountJid(jid: string): boolean {
@@ -1254,22 +1339,12 @@ export class WaCallMediaSession {
         this.applyPeerRaiseHand(node, peerJid)
     }
 
-    /**
-     * Handles a top-level `<raise_hand>`: a message type of its own, not a variant of
-     * `<user_action>`, and still sent by current clients. Dropping this handler routes
-     * those stanzas to the router's default branch and loses the hand silently.
-     */
+    /** A top-level `<raise_hand>`: a message type of its own, still sent beside `<user_action>`. */
     handleCallRaiseHand(node: BinaryNode, peerJid: string): void {
         this.applyPeerRaiseHand(node, peerJid)
     }
 
-    /**
-     * Records the state a stanza of either shape carried. Idempotent, as the sender is.
-     *
-     * A hand from another device of our own account is dropped, as `<mute_v2>` drops one:
-     * the local hand is `stateData.handRaised`, and letting the echo in lists
-     * this account among the remote participants holding one up.
-     */
+    /** Records the hand a stanza of either shape carried; one from our own account is dropped. */
     private applyPeerRaiseHand(node: BinaryNode, peerJid: string): void {
         const nodeInfo = extractNodeInfo(node)
         if (!nodeInfo) return
@@ -1313,15 +1388,8 @@ export class WaCallMediaSession {
         this.delegate.emitHandRaise(this.info, peerJid, raised)
     }
 
-    /**
-     * Records the screen-share state a `screen_share` or `screen` stanza carried.
-     *
-     * Nothing extra goes back: the router already acked it and no screen-share tag
-     * appears among the message types - by analogy with the video-state ack, not
-     * confirmed. The picture itself arrives as ordinary H.264 on the sender's video
-     * stream, which the receive path already handles.
-     */
-    handleCallScreenShare(node: BinaryNode): void {
+    /** Records the screen-share state a `screen_share` or `screen` stanza carried; nothing goes back. */
+    handleCallScreenShare(node: BinaryNode, participantJid?: string): void {
         const nodeInfo = extractNodeInfo(node)
         if (!nodeInfo) return
 
@@ -1334,29 +1402,28 @@ export class WaCallMediaSession {
             return
         }
 
-        this.info.peerScreenShare = share
+        const key = this.toAddressedJid(participantJid ?? this.acceptedByJid ?? this.info.peerJid)
+        const entry = this.participantEntry(key)
+        if (entry) entry.screenShare = share
+        if (!this.isGroupCall) this.info.peerScreenShare = share
         this.logger.debug('peer screen share state', {
             callId: this.info.callId,
+            participantJid: key,
             tag: nodeInfo.tag,
             state: share.state,
             requestState: share.requestState,
             version: share.version
         })
 
-        this.delegate.emitScreenShare(this.info, share)
+        this.delegate.emitScreenShare(this.info, share, key)
         this.delegate.emitState(this.info)
     }
 
     /**
-     * Applies a `<video>` from the peer: a mid-call video state change, and with it the
-     * audio-to-video upgrade, which has no stanza of its own.
-     *
-     * A message whose `transaction-id` does not advance past the last one from this peer is
-     * a replay, and is dropped only on a call whose profile asks for that - otherwise it is
-     * noted and handled like any other. The bridge's ack is transport only, not an
-     * acceptance - that is a `<video state='4'>` coming the other way.
+     * Applies a `<video>` from the peer: a video state change, and with it the upgrade handshake.
+     * A replayed `transaction-id` is dropped only when the profile enforces it.
      */
-    handleCallVideoState(node: BinaryNode): void {
+    handleCallVideoState(node: BinaryNode, participantJid?: string): void {
         const nodeInfo = extractNodeInfo(node)
         if (!nodeInfo) return
 
@@ -1368,7 +1435,18 @@ export class WaCallMediaSession {
             return
         }
 
-        if (this.isStaleVideoState(change.transactionId)) {
+        const key = this.toAddressedJid(participantJid ?? this.acceptedByJid ?? this.info.peerJid)
+        if (this.isGroupCall) {
+            this.applyGroupVideoState(node, change, key)
+            return
+        }
+
+        if (
+            this.isStaleVideoState(
+                change.transactionId,
+                this.info.peerVideoState?.transactionId ?? null
+            )
+        ) {
             this.logger.debug('stale video state', {
                 callId: this.info.callId,
                 transactionId: change.transactionId,
@@ -1378,14 +1456,16 @@ export class WaCallMediaSession {
             if (this.videoStateTxnEnforced) return
         }
 
-        // The server attaches a second, larger `<voip_settings>` to an upgrade request,
-        // carrying the video sections the audio profile lacks. Only the receiver gets one.
+        // An upgrade request carries the larger video profile.
         this.applyVoipSettings(parseVoipSettings(node, this.logger))
 
         this.info.peerVideoState = change
         this.peerVideoStateSeen++
         this.ensureVideoReceivePath()
         this.applyPeerUpgradeState(change.state)
+
+        const entry = this.participantEntry(key)
+        if (entry) entry.video = change
 
         this.logger.debug('peer video state changed', {
             callId: this.info.callId,
@@ -1395,38 +1475,939 @@ export class WaCallMediaSession {
             encoderCodec: change.encoderCodec
         })
 
-        this.delegate.emitPeerVideoState(this.info, change)
+        this.delegate.emitPeerVideoState(this.info, change, key)
     }
 
     /**
-     * Whether an inbound `<video>` repeats a transaction already seen.
-     *
-     * `transaction-id` is the sender's own counter and only ever advances, so every
-     * message the peer sends - answers to our own included - carries a number above the
-     * last one it sent. One that does not advance is a replay. The counter this side
-     * stamps on what it sends is a separate one and is never compared against this.
-     *
-     * Saying so is not the same as acting on it: whether a replay is dropped is a key of
-     * the negotiated profile, and the calls measured so far do not carry it. Answering
-     * the question apart from enforcing the answer keeps the log honest on a call that
-     * handles the message anyway.
+     * Seeds a group call's composition from the `<group_info>` of its offer, leaving out whoever
+     * it already reports off the call. An unreadable or empty one seeds nothing.
      */
-    private isStaleVideoState(transactionId: number | null): boolean {
-        if (transactionId === null) return false
+    seedGroupComposition(inner: BinaryNode): void {
+        let roster: GroupCallRoster
+        try {
+            roster = readGroupCallRoster(inner)
+        } catch (err) {
+            this.logger.warn('offer carried an unreadable group_info', {
+                callId: this.info.callId,
+                message: toError(err).message
+            })
+            return
+        }
+        if (roster.kind !== 'roster') {
+            if (roster.kind === 'empty') {
+                this.logger.warn('offer carried a group_info listing nobody, no composition set', {
+                    callId: this.info.callId
+                })
+            }
+            return
+        }
 
-        const last = this.info.peerVideoState?.transactionId ?? null
-        return last !== null && transactionId <= last
+        const present = roster.participants.filter(
+            (participant) => !isGroupParticipantLeaving(participant)
+        )
+        this.info.groupComposition = createGroupComposition(present)
+        // A key that beat the offer was installed before anyone could be keyed with it.
+        if (this.info.encryptionKey) void this.syncGroupMedia()
+        this.logger.debug('group call composition seeded from the offer', {
+            callId: this.info.callId,
+            participantCount: present.length,
+            connectedLimit: roster.info.connectedLimit
+        })
     }
 
     /**
-     * Moves the upgrade handshake on the state the peer just announced.
-     *
-     * The codes split by who they are about: a request is the peer opening a handshake
-     * against us and is only recorded, because answering is the caller's decision, while
-     * a terminal code settles a request *we* sent - the same code with nothing pending is
-     * the peer closing its own, not an answer to us. Either way it clears the peer's
-     * outstanding request: left set, a later {@link requestVideoUpgrade} takes the
-     * crossing branch and opens our sender against a peer still on audio.
+     * Seeds a group call we join after its ring from what was kept of it: the last roster seen,
+     * the server's settings and, when known, its relay. Without a relay the media waits for the
+     * one the `group_update` answering our accept brings.
+     */
+    seedGroupJoin(context: {
+        readonly participants: readonly WaCallGroupParticipant[]
+        readonly transactionId: number | null
+        readonly relayData?: RelayData
+        readonly voipSettings?: WaVoipSettings | null
+    }): void {
+        this.info.groupComposition = createGroupComposition(
+            context.participants.filter((participant) => !isGroupParticipantLeaving(participant)),
+            context.transactionId
+        )
+        if (context.relayData) this.info.relayData = context.relayData
+        this.applyVoipSettings(context.voipSettings ?? null)
+    }
+
+    /** Seeds the composition of a group call we place, from the participants our offer named. */
+    seedOutgoingGroupComposition(participants: readonly WaCallGroupParticipant[]): void {
+        this.info.groupComposition = createGroupComposition(participants)
+    }
+
+    /**
+     * Applies a `<group_update>`: first a reissued `<relay>`, whatever the roster says, then the
+     * roster, then the rekey it asks of us. A stale roster is dropped but its rekey is not. A
+     * roster listing somebody else connected is what connects a call we placed.
+     */
+    async handleCallGroupUpdate(node: BinaryNode): Promise<void> {
+        const nodeInfo = extractNodeInfo(node)
+        if (!nodeInfo) return
+        const inner = nodeInfo.innerNode
+
+        await this.adoptReissuedRelays(inner, readGroupUpdateTransactionId(inner))
+
+        // Only `av-upgrader` is an upgrade; `av-upgradable` rides every call as a capability.
+        const upgrader = findNodeChild(inner, 'av_upgrade')?.attrs?.['av-upgrader']
+        if (upgrader) this.applyGroupVideoUpgrade(node, upgrader)
+
+        let roster: GroupCallRoster
+        try {
+            roster = readGroupCallRoster(inner)
+        } catch (err) {
+            this.logger.warn('group update carried an unreadable group_info', {
+                callId: this.info.callId,
+                message: toError(err).message
+            })
+            return
+        }
+        if (roster.kind === 'empty') {
+            this.logger.warn('group update carried a group_info listing nobody, composition kept', {
+                callId: this.info.callId
+            })
+        }
+
+        const listed = roster.kind === 'roster' ? roster.info.participants : NO_LISTED_PARTICIPANTS
+        const composition = this.info.groupComposition ?? createGroupComposition([])
+        const transactionId = this.groupUpdateTransactionId(
+            inner,
+            listed,
+            composition,
+            roster.kind === 'roster' ? roster.info.transactionId : null
+        )
+        const rekeyAnnounced =
+            (roster.kind === 'roster' && roster.info.rekey) ||
+            listed.some((participant) => participant.rekey)
+        const outcome = applyGroupUpdate(
+            composition,
+            {
+                transactionId,
+                participants: roster.kind === 'roster' ? roster.participants : undefined,
+                rekey: rekeyAnnounced
+            },
+            this.logger
+        )
+
+        if (!outcome.applied) {
+            this.logger.debug('group update not folded in', {
+                callId: this.info.callId,
+                discardReason: outcome.discardReason,
+                transactionId,
+                rekeyAnnounced
+            })
+            if (rekeyAnnounced && this.acceptAnnouncedRekey(transactionId)) {
+                await this.runGroupRekeyFanout(transactionId, listed)
+            }
+            return
+        }
+
+        const rekeyAccepted = rekeyAnnounced && this.acceptAnnouncedRekey(transactionId)
+        this.info.groupComposition = outcome.composition
+        this.logGroupDiff('group call composition changed', outcome.diff)
+        this.forgetDepartedDevices(outcome.diff)
+        await this.syncGroupMedia()
+        this.refreshVideoSubscriptions()
+        // The creator hears no `<accept>`: a roster listing somebody else connected is the join.
+        const joined = this.hasOtherParticipantConnected() && this.joinPlacedGroupCall('roster')
+
+        this.delegate.emitParticipantsChanged?.(this.info, outcome.diff)
+        this.delegate.emitState(this.info)
+        if (joined) {
+            this.startHeartbeat()
+            await this.publish({ accepted: true })
+        }
+        if (this.anyoneArrived(composition, outcome.composition)) this.rebroadcastOwnState()
+
+        if (rekeyAccepted) await this.runGroupRekeyFanout(transactionId, listed)
+    }
+
+    /**
+     * Follows a `<relay>` a `group_update` or `<transport>` reissues: a new generation of every
+     * dialable relay, elected first, when addresses, credentials or pids changed. An identical
+     * repeat or an older `group_update` publishes nothing; an omitted participant list is kept.
+     */
+    private async adoptReissuedRelays(
+        inner: BinaryNode,
+        transactionId: number | null
+    ): Promise<void> {
+        const {
+            endpoints: relays,
+            participantJids,
+            uuid,
+            selfPid,
+            peerPid
+        } = parseRelayFromAck(inner)
+        if (relays.length === 0) return
+
+        const newest = this.relayTransactionId
+        if (transactionId !== null && newest !== null && transactionId < newest) {
+            this.logger.debug('relay descriptor of an older group update, ignored', {
+                callId: this.info.callId,
+                transactionId,
+                newestTransactionId: newest
+            })
+            return
+        }
+        if (transactionId !== null) this.relayTransactionId = transactionId
+
+        const current = this.info.relayData
+        const elected = adoptableRelayEndpoints(relays)
+        const held = current ? adoptableRelayEndpoints(current.endpoints) : []
+        const unchanged =
+            current !== undefined &&
+            (elected.length > 0
+                ? sameRelayCredentials(held, elected) &&
+                  current.selfPid === selfPid &&
+                  current.peerPid === peerPid
+                : sameRelayEndpointSet(current.endpoints, relays))
+        if (unchanged) {
+            this.logger.debug('relay descriptor reissued, already followed', {
+                callId: this.info.callId,
+                transactionId,
+                endpointCount: relays.length,
+                electedRelay: elected[0]?.relayName
+            })
+            return
+        }
+
+        this.info.relayData = {
+            endpoints: relays,
+            participantJids: current?.participantJids?.length
+                ? current.participantJids
+                : participantJids,
+            uuid: uuid || current?.uuid,
+            selfPid,
+            peerPid
+        }
+        if (elected.length === 0) {
+            this.logger.debug('relay descriptor reissued with nothing dialable', {
+                callId: this.info.callId,
+                endpointCount: relays.length
+            })
+            return
+        }
+
+        const endpoints = elected.map((endpoint): WaCallMediaRelay => {
+            const relay = toMediaRelay(endpoint)
+            const transport = adoptedRelayTransport(endpoint)
+            return transport ? { ...relay, transport } : relay
+        })
+        this.adoptedRelays = {
+            endpoints,
+            selfPid,
+            peerPid,
+            generation: ++this.relayGeneration
+        }
+        this.logger.debug('relay descriptor reissued, call moved', {
+            callId: this.info.callId,
+            transactionId,
+            electedRelay: elected[0].relayName,
+            relayNames: [...new Set(elected.map((endpoint) => endpoint.relayName))],
+            endpointsPublished: elected.length,
+            electedRtt: elected[0].c2rRtt,
+            generation: this.relayGeneration,
+            selfPid,
+            peerPid,
+            transports: endpoints.map((endpoint) => endpoint.transport ?? 'default'),
+            tokenIds: elected.map((endpoint) => endpoint.tokenId ?? null),
+            tokenLengths: elected.map(
+                (endpoint) => endpoint.rawToken?.length ?? endpoint.token.length
+            ),
+            authTokenIds: elected.map((endpoint) =>
+                endpoint.authToken ? endpoint.authTokenId : null
+            ),
+            authTokenLengths: elected.map(
+                (endpoint) => endpoint.rawAuthToken?.length ?? endpoint.authToken?.length ?? 0
+            )
+        })
+        await this.publish({ relays: this.adoptedRelays })
+    }
+
+    /** Whether the rekey announced under `transactionId` is ours to run; records it when it is. */
+    private acceptAnnouncedRekey(transactionId: number): boolean {
+        const honoured = this.lastHonouredRekeyTransactionId
+        if (honoured !== null && transactionId <= honoured) {
+            this.logger.debug('group rekey already answered at this transaction id or newer', {
+                callId: this.info.callId,
+                transactionId,
+                honouredTransactionId: honoured
+            })
+            return false
+        }
+        this.lastHonouredRekeyTransactionId = transactionId
+        return true
+    }
+
+    /**
+     * Runs the rekey a `<group_info rekey>` makes us master of: a new call key, installed and sent
+     * in one `<enc_rekey>` per device of every other connected participant but `tos_not_accepted`.
+     */
+    private async runGroupRekeyFanout(
+        transactionId: number,
+        listed: readonly GroupInfoParticipant[]
+    ): Promise<void> {
+        const composition = this.info.groupComposition
+        const selfKey = this.selfAccountKey()
+        if (composition === undefined || selfKey === null) {
+            this.logger.warn('group rekey asked of us, not run', {
+                callId: this.info.callId,
+                transactionId,
+                reason: composition === undefined ? 'no_composition' : 'no_self_jid'
+            })
+            return
+        }
+
+        const connected = composition.participants.filter(
+            (participant) => participant.state === WA_CALL_PARTICIPANT_STATE.Connected
+        )
+        const selfConnected = connected.some(
+            (participant) => this.accountKeyOf(participant) === selfKey
+        )
+        if (!selfConnected || connected.length < 2) {
+            this.logger.debug('group rekey asked of us, not run', {
+                callId: this.info.callId,
+                transactionId,
+                reason: selfConnected ? 'nobody_else_connected' : 'self_not_connected',
+                connectedCount: connected.length
+            })
+            return
+        }
+
+        const termsNotAccepted = new Set(
+            listed
+                .filter((participant) => participant.tosNotAccepted)
+                .map((participant) => groupParticipantAccountKey(participant.jid))
+        )
+
+        const callKey = generateCallKey()
+        await this.applyCallKey(callKey, transactionId)
+
+        let sent = 0
+        let skipped = 0
+        let lastError = ''
+        const failed: string[] = []
+        for (const participant of connected) {
+            const accountKey = this.accountKeyOf(participant)
+            if (accountKey === selfKey) continue
+            if (termsNotAccepted.has(accountKey)) {
+                skipped++
+                continue
+            }
+            for (const deviceJid of participant.devices) {
+                try {
+                    const stanza = await buildEncRekeyStanza(this.deps, {
+                        callId: this.info.callId,
+                        callCreator: this.info.callCreator,
+                        transactionId,
+                        peerDeviceJid: deviceJid,
+                        callKey
+                    })
+                    await this.deps.lowLevelCoordinator.sendNode(stanza)
+                    sent++
+                } catch (err) {
+                    failed.push(deviceJid)
+                    lastError = toError(err).message
+                }
+            }
+        }
+
+        if (failed.length > 0) {
+            this.logger.warn('group rekey did not reach every device', {
+                callId: this.info.callId,
+                transactionId,
+                message: lastError,
+                droppedCount: failed.length,
+                totalExpected: sent + failed.length,
+                sample: failed.slice(0, 3)
+            })
+        }
+        this.logger.debug('group rekey distributed', {
+            callId: this.info.callId,
+            transactionId,
+            connectedCount: connected.length,
+            sent,
+            failed: failed.length,
+            skipped
+        })
+    }
+
+    /**
+     * Installs a group call key, from an `<enc_rekey>` or from our own rekey, and republishes
+     * the keys and every sender's. A key equal to the one installed changes nothing; a call
+     * that is no group's ignores it.
+     */
+    async applyCallKey(callKey: Uint8Array, transactionId: number | null): Promise<void> {
+        if (!this.isGroupCall) {
+            this.logger.debug('call key for a call that is no group, ignored', {
+                callId: this.info.callId,
+                transactionId
+            })
+            return
+        }
+        const installed = this.info.encryptionKey
+        if (installed && uint8TimingSafeEqual(installed, callKey)) {
+            this.logger.debug('call key repeated, already installed', {
+                callId: this.info.callId,
+                transactionId
+            })
+            return
+        }
+
+        this.info.encryptionKey = callKey
+        this.logger.debug('group call key installed', { callId: this.info.callId, transactionId })
+        await this.syncGroupMedia()
+    }
+
+    /**
+     * Takes the sender of a `<terminate>` off a group call that goes on. Not a roster, so the
+     * `transaction-id` the server orders rosters by does not move.
+     */
+    removeGroupParticipant(peerJid: string | undefined, reason: string | undefined): void {
+        const composition = this.info.groupComposition
+        const key = peerJid ? groupParticipantAccountKey(peerJid) : null
+        const departing =
+            key === null
+                ? undefined
+                : composition?.participants.find(
+                      (participant) => this.accountKeyOf(participant) === key
+                  )
+        if (!composition || !departing) {
+            this.logger.debug('group participant left, not on the composition', {
+                callId: this.info.callId,
+                peerJid: peerJid ?? null,
+                reason: reason ?? null
+            })
+            return
+        }
+
+        const remaining = composition.participants.filter(
+            (participant) => participant !== departing
+        )
+        const diff = diffGroupParticipants(
+            composition.participants,
+            [...remaining, { ...departing, state: WA_CALL_PARTICIPANT_STATE.Terminated }],
+            this.logger
+        )
+        this.info.groupComposition = {
+            participants: remaining,
+            lastTransactionId: composition.lastTransactionId
+        }
+        this.forgetDepartedDevices(diff)
+        this.logGroupDiff('group participant left the call', diff, {
+            peerJid,
+            reason: reason ?? null
+        })
+        void this.syncGroupMedia()
+
+        this.delegate.emitParticipantsChanged?.(this.info, diff)
+        this.delegate.emitState(this.info)
+    }
+
+    /**
+     * The number an update is ordered by: its `<group_info>`'s, else the wrapper's, else the
+     * highest a participant carries, else one past the last applied.
+     */
+    private groupUpdateTransactionId(
+        inner: BinaryNode,
+        listed: readonly GroupInfoParticipant[],
+        composition: WaGroupComposition,
+        rosterTransactionId: number | null
+    ): number {
+        if (rosterTransactionId !== null) return rosterTransactionId
+        const own = tryAsNumber(inner.attrs?.['transaction-id'])
+        if (own !== null) return own
+
+        let highest: number | null = null
+        for (const participant of listed) {
+            const id = participant.transactionId
+            if (id !== null && (highest === null || id > highest)) highest = id
+        }
+        return highest ?? (composition.lastTransactionId ?? 0) + 1
+    }
+
+    private logGroupDiff(
+        message: string,
+        diff: WaGroupCompositionDiff,
+        context: Record<string, unknown> = {}
+    ): void {
+        this.logger.debug(message, {
+            callId: this.info.callId,
+            ...context,
+            added: diff.added.length,
+            removed: diff.removed.length,
+            switched: diff.switched.length,
+            devicesAdded: diff.devicesAdded.length,
+            devicesRemoved: diff.devicesRemoved.length,
+            rekeyRequired: diff.rekeyRequired,
+            rekeyReason: diff.rekeyReason,
+            participantCount: this.info.groupComposition?.participants.length ?? 0
+        })
+    }
+
+    private selfAccountKey(): string | null {
+        const selfJid = selfJidOf(this.deps) || this.selfDeviceJid
+        if (!selfJid) return null
+        if (this.selfKeyOf?.jid !== selfJid) {
+            this.selfKeyOf = { jid: selfJid, key: groupParticipantAccountKey(selfJid) }
+        }
+        return this.selfKeyOf.key
+    }
+
+    private accountKeyOf(participant: WaCallGroupParticipant): string {
+        let key = this.accountKeys.get(participant)
+        if (key === undefined) {
+            key = groupParticipantAccountKey(participant.jid)
+            this.accountKeys.set(participant, key)
+        }
+        return key
+    }
+
+    /** Every device sending into this group call, ourselves left out. */
+    private groupSenderDevices(): string[] {
+        const composition = this.info.groupComposition
+        if (!composition) return []
+        return groupSenderDeviceJids(
+            composition,
+            selfJidOf(this.deps) || this.selfDeviceJid,
+            (participant) => this.accountKeyOf(participant)
+        )
+    }
+
+    /** Whether every sender's video gets keyed: a video call, or video receiving opened. */
+    private get groupCoversVideo(): boolean {
+        return this.info.mediaType === CallMediaType.Video || this.videoReceivePathOpened
+    }
+
+    /** The plan's `group` section, once there is a key and a composition to derive it from. */
+    private groupSection(senders: GroupSenders): WaCallMediaGroup | null {
+        const callKey = this.info.encryptionKey
+        if (!callKey || !this.info.groupComposition) return null
+        return this.derivations.groupSection(
+            callKey,
+            senders.devices,
+            senders.streamsOf,
+            groupDevicePids(this.info.groupComposition),
+            this.videoSubscriptions
+        )
+    }
+
+    /** The sending devices and their streams, derived once for everything one sync publishes. */
+    private groupSenders(): GroupSenders {
+        const devices = this.groupSenderDevices()
+        const coversVideo = this.groupCoversVideo
+        const streams = new Map<string, number[]>()
+        return {
+            devices,
+            streamsOf: (deviceJid) => {
+                let found = streams.get(deviceJid)
+                if (!found) {
+                    found = this.derivations.senderStreams(deviceJid, coversVideo)
+                    streams.set(deviceJid, found)
+                }
+                return found
+            }
+        }
+    }
+
+    /** Republishes what a group call derives from its composition and key, together. */
+    private async syncGroupMedia(): Promise<void> {
+        if (!this.isGroupCall) return
+        const senders = this.groupSenders()
+        this.syncGroupSenders(senders.devices)
+        const keys = this.info.encryptionKey ? this.deriveKeys() : null
+        const group = keys ? this.groupSection(senders) : null
+        await this.publish({
+            ...(this.selfDeviceJid ? { ssrcs: this.buildSsrcs(senders) } : {}),
+            ...(keys ? { keys } : {}),
+            ...(group ? { group } : {})
+        })
+    }
+
+    /** Maps each sender id back to its device, and its media entry to the sender id. */
+    private syncGroupSenders(devices: readonly string[]): void {
+        const senders = this.info.groupSenders
+        senders.clear()
+        for (const deviceJid of devices) {
+            const senderId = this.derivations.senderId(deviceJid)
+            const key = this.toAddressedJid(deviceJid)
+            senders.set(senderId, key)
+            const entry = this.participantEntry(key)
+            if (entry) entry.senderId = senderId
+        }
+    }
+
+    /** Forgets every device a roster change took off the call. */
+    private forgetDepartedDevices(diff: WaGroupCompositionDiff): void {
+        for (const removal of diff.removed) {
+            for (const deviceJid of removal.participant.devices) {
+                this.forgetParticipantDevice(deviceJid)
+            }
+        }
+        for (const change of diff.devicesRemoved) this.forgetParticipantDevice(change.deviceJid)
+        for (const change of diff.switched) this.forgetParticipantDevice(change.previousDeviceJid)
+    }
+
+    /**
+     * Applies a `<video>` a group participant sent: its own camera, per device, ordered by its
+     * own counter. None of the 1:1 upgrade handshake applies.
+     */
+    private applyGroupVideoState(
+        node: BinaryNode,
+        change: PeerVideoStateChange,
+        participantJid: string
+    ): void {
+        const entry = this.participantEntry(participantJid)
+        const last = entry?.video?.transactionId ?? null
+        if (this.isStaleVideoState(change.transactionId, last)) {
+            this.logger.debug('stale video state', {
+                callId: this.info.callId,
+                participantJid,
+                transactionId: change.transactionId,
+                lastTransactionId: last,
+                enforced: this.videoStateTxnEnforced
+            })
+            if (this.videoStateTxnEnforced) return
+        }
+
+        this.applyVoipSettings(parseVoipSettings(node, this.logger))
+        if (entry) entry.video = change
+        this.ensureVideoReceivePath()
+        this.refreshVideoSubscriptions()
+
+        this.logger.debug('participant video state changed', {
+            callId: this.info.callId,
+            participantJid,
+            state: change.state,
+            transactionId: change.transactionId
+        })
+        this.delegate.emitPeerVideoState(this.info, change, participantJid)
+    }
+
+    /**
+     * The server turned this group call into a video call: our receive path opens, the requester's
+     * camera goes on, and a camera that stays off is announced as stopped.
+     */
+    private applyGroupVideoUpgrade(node: BinaryNode, upgrader: string): void {
+        const upgraderJid = this.toAddressedJid(upgrader)
+        if (this.groupVideoUpgraded) return
+        this.groupVideoUpgraded = true
+
+        const asked = this.pendingVideoUpgrade !== null || this.isOwnAccountJid(upgraderJid)
+        this.applyVoipSettings(parseVoipSettings(node, this.logger))
+        this.ensureVideoReceivePath()
+        this.info.mediaType = CallMediaType.Video
+
+        if (asked) {
+            this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.Accepted)
+            this.applyGroupVideoSend(true)
+        } else if (this.groupVideoSend !== true) {
+            this.groupVideoSend = false
+            void this.publish({ video: this.videoSection() })
+            this.sendVideoStateDetached(WA_VIDEO_STATE.Stopped)
+        }
+
+        this.logger.debug('group call upgraded to video', {
+            callId: this.info.callId,
+            upgraderJid,
+            asked
+        })
+        this.delegate.emitVideoUpgraded?.(this.info, upgraderJid)
+    }
+
+    /**
+     * Turns our camera on or off on a group call; a 1:1 call uses {@link requestVideoUpgrade}.
+     * @throws on a 1:1 call, or when the send fails, leaving the camera as it was.
+     */
+    async setVideoEnabled(enabled: boolean): Promise<void> {
+        if (!this.isGroupCall) {
+            throw new Error(`Call ${this.info.callId} is not a group call; request an upgrade`)
+        }
+        if (!this.info.isActive || this.groupVideoSending === enabled) return
+
+        await this.sendVideoState(enabled ? WA_VIDEO_STATE.Enabled : WA_VIDEO_STATE.Stopped)
+        this.applyGroupVideoSend(enabled)
+    }
+
+    private get groupVideoSending(): boolean {
+        return this.groupVideoSend ?? this.info.mediaType === CallMediaType.Video
+    }
+
+    private applyGroupVideoSend(enabled: boolean): void {
+        this.groupVideoSend = enabled
+        if (enabled) this.ensureVideoReceivePath()
+        void this.publish({ video: this.videoSection() })
+        if (enabled) {
+            this.announceVideoLive()
+            return
+        }
+        if (!this.info.isActive || this.info.stateData.videoOff) return
+        this.info.applyTransition({ type: 'video_state_changed', off: true })
+        this.delegate.emitState(this.info)
+    }
+
+    /**
+     * Asks the server to turn a group audio call into a video call: `UpgradeRequest` to the
+     * call. Resolves `accepted` once its `<av_upgrade>` arrives, our camera then on, or
+     * `timeout`. On a call already carrying video it only turns our camera on.
+     */
+    private async requestGroupVideoUpgrade(): Promise<WaVideoUpgradeResult> {
+        if (!this.info.isActive) {
+            throw new Error(`Call ${this.info.callId} is not active`)
+        }
+        if (this.groupVideoSending) {
+            throw new Error(`Call ${this.info.callId} already carries video`)
+        }
+        if (this.info.mediaType === CallMediaType.Video) {
+            await this.setVideoEnabled(true)
+            return WA_VIDEO_UPGRADE_RESULT.Accepted
+        }
+        if (this.pendingVideoUpgrade) return this.pendingVideoUpgrade.promise
+
+        let settle!: (result: WaVideoUpgradeResult) => void
+        const promise = new Promise<WaVideoUpgradeResult>((resolve) => {
+            settle = resolve
+        })
+        const timer = setTimeout(() => this.onVideoUpgradeTimeout(), WA_VIDEO_UPGRADE_TIMEOUT_MS)
+        timer.unref?.()
+        this.pendingVideoUpgrade = { timer, settle, promise }
+
+        try {
+            await this.sendVideoState(WA_VIDEO_STATE.UpgradeRequest)
+        } catch (err) {
+            this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.Failed)
+            throw err
+        }
+        return promise
+    }
+
+    /**
+     * Overrides whose video is asked of the SFU; `null` hands it back to the policy: every
+     * camera that is on, at most four, once more than two are connected.
+     */
+    setVideoSubscriptions(subscriptions: readonly CallVideoSubscription[] | null): void {
+        this.videoSubscriptionOverride =
+            subscriptions === null
+                ? null
+                : subscriptions.flatMap((subscription) => {
+                      const senderId = this.info.participantMedia.get(
+                          this.toAddressedJid(subscription.participantJid)
+                      )?.senderId
+                      return senderId
+                          ? [
+                                {
+                                    senderId,
+                                    quality: subscription.quality ?? WA_VIDEO_QUALITY.Default
+                                }
+                            ]
+                          : []
+                  })
+        this.refreshVideoSubscriptions()
+    }
+
+    /** Recomputes the video subscriptions, at most once per {@link VIDEO_SUBSCRIPTION_MIN_INTERVAL_MS}. */
+    private refreshVideoSubscriptions(): void {
+        if (!this.isGroupCall || this.videoSubscriptionTimer) return
+        const next = this.videoSubscriptionOverride ?? this.policyVideoSubscriptions()
+        if (samePlanValue(next, this.videoSubscriptions)) return
+
+        const since =
+            this.videoSubscriptionsChangedAt === null
+                ? Infinity
+                : this.now() - this.videoSubscriptionsChangedAt
+        if (since < VIDEO_SUBSCRIPTION_MIN_INTERVAL_MS) {
+            this.videoSubscriptionTimer = setTimeout(() => {
+                this.videoSubscriptionTimer = null
+                this.refreshVideoSubscriptions()
+            }, VIDEO_SUBSCRIPTION_MIN_INTERVAL_MS - since)
+            this.videoSubscriptionTimer.unref?.()
+            return
+        }
+
+        this.videoSubscriptions = next
+        this.videoSubscriptionsChangedAt = this.now()
+        this.logger.debug('video subscriptions changed', {
+            callId: this.info.callId,
+            subscriptions: next.length
+        })
+        void this.syncGroupMedia()
+    }
+
+    private policyVideoSubscriptions(): WaCallMediaVideoSubscription[] {
+        const connected = (this.info.groupComposition?.participants ?? []).filter(
+            (participant) => participant.state === WA_CALL_PARTICIPANT_STATE.Connected
+        ).length
+        const senders: { senderId: string; videoEnabled: boolean }[] = []
+        for (const [senderId, deviceJid] of this.info.groupSenders) {
+            const state = this.info.participantMedia.get(deviceJid)?.video?.state
+            senders.push({ senderId, videoEnabled: state === WA_VIDEO_STATE.Enabled })
+        }
+        return selectVideoSubscriptions(senders, connected)
+    }
+
+    /**
+     * A group sender's media started or stopped reaching us, as the media host reports it.
+     * Edge-triggered: an unchanged state is not reported again.
+     */
+    handleSenderMedia(senderId: string, receiving: boolean): void {
+        const participantJid = this.info.groupSenders.get(senderId)
+        if (!participantJid) {
+            this.logger.debug('media of an unknown group sender', {
+                callId: this.info.callId,
+                senderId,
+                receiving
+            })
+            return
+        }
+        const entry = this.participantEntry(participantJid)
+        if (entry) {
+            if (entry.receiving === receiving) return
+            entry.receiving = receiving
+        }
+        if (receiving) {
+            this.senderWaitingSince.delete(participantJid)
+            this.invisibleReported.delete(groupParticipantAccountKey(participantJid))
+        } else {
+            this.senderWaitingSince.set(participantJid, this.now())
+        }
+        this.delegate.emitParticipantMedia?.(this.info, participantJid, receiving)
+    }
+
+    /**
+     * Reports invisible, once, each connected member none of whose devices was heard for
+     * {@link PEER_INVISIBLE_AFTER_MS}; nobody while nobody at all is heard, our own path down.
+     */
+    private sweepInvisibleSenders(): void {
+        const media = this.info.participantMedia
+        if (!this.hearsAnySender()) return
+
+        const selfKey = this.selfAccountKey()
+        const now = this.now()
+        for (const participant of this.info.groupComposition?.participants ?? []) {
+            if (participant.state !== WA_CALL_PARTICIPANT_STATE.Connected) continue
+            const accountKey = this.accountKeyOf(participant)
+            if (accountKey === selfKey || this.invisibleReported.has(accountKey)) continue
+            if (participant.devices.length === 0) continue
+
+            let silentMs = Infinity
+            for (const deviceJid of participant.devices) {
+                const key = this.toAddressedJid(deviceJid)
+                if (media.get(key)?.receiving === true) {
+                    silentMs = -1
+                    break
+                }
+                const since = this.senderWaitingSince.get(key)
+                if (since === undefined) this.senderWaitingSince.set(key, now)
+                silentMs = Math.min(silentMs, since === undefined ? 0 : now - since)
+            }
+            if (silentMs < PEER_INVISIBLE_AFTER_MS) continue
+
+            this.invisibleReported.add(accountKey)
+            this.reportPeerInvisible(participant.jid, silentMs)
+        }
+    }
+
+    private hearsAnySender(): boolean {
+        for (const entry of this.info.participantMedia.values()) {
+            if (entry.receiving === true) return true
+        }
+        return false
+    }
+
+    private reportPeerInvisible(peerJid: string, silentMs: number): void {
+        this.logger.debug('reporting a peer invisible', {
+            callId: this.info.callId,
+            peerJid,
+            silentMs: Math.round(silentMs)
+        })
+        this.sendDetached(
+            buildPeerStateStanza(
+                this.info.callId,
+                this.info.callCreator,
+                peerJid,
+                WA_PEER_STATE.Invisible
+            ),
+            'peer_state send failed'
+        )
+    }
+
+    /** Sends the call a `<heartbeat>` now and on every interval while this group call lasts. */
+    private startHeartbeat(): void {
+        if (!this.isGroupCall || this.heartbeatTimer || this.info.isEnded) return
+        const intervalMs = this.info.voipSettings?.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS
+        this.sendHeartbeat()
+        this.heartbeatTimer = setInterval(() => this.sendHeartbeat(), intervalMs)
+        this.heartbeatTimer.unref?.()
+        this.logger.debug('group heartbeat started', { callId: this.info.callId, intervalMs })
+    }
+
+    private sendHeartbeat(): void {
+        this.sendDetached(
+            buildHeartbeatStanza(this.info.callId, this.info.callCreator),
+            'heartbeat send failed',
+            'trace'
+        )
+    }
+
+    /** Whether a roster change brought somebody else in, or connected somebody already listed. */
+    private anyoneArrived(before: WaGroupComposition, after: WaGroupComposition): boolean {
+        const selfKey = this.selfAccountKey()
+        const connectedBefore = new Set<string>()
+        const listedBefore = new Set<string>()
+        for (const participant of before.participants) {
+            const key = this.accountKeyOf(participant)
+            listedBefore.add(key)
+            if (participant.state === WA_CALL_PARTICIPANT_STATE.Connected) connectedBefore.add(key)
+        }
+        return after.participants.some((participant) => {
+            const key = this.accountKeyOf(participant)
+            if (key === selfKey) return false
+            if (!listedBefore.has(key)) return true
+            return (
+                participant.state === WA_CALL_PARTICIPANT_STATE.Connected &&
+                !connectedBefore.has(key)
+            )
+        })
+    }
+
+    /**
+     * Re-announces our own state to the call when somebody arrives, since nothing else tells a
+     * newcomer: our mute state always, our hand only while it is up. Video is not replayed.
+     */
+    private rebroadcastOwnState(): void {
+        if (!this.info.isActive) return
+        this.sendDetached(
+            this.muteV2Stanza(this.info.stateData.audioMuted),
+            'state re-broadcast failed'
+        )
+        if (this.info.stateData.handRaised) {
+            this.sendDetached(
+                buildRaiseHandStanza(
+                    this.inCallTarget(),
+                    this.info.callId,
+                    this.info.callCreator,
+                    true
+                ),
+                'state re-broadcast failed'
+            )
+        }
+        this.logger.debug('own state re-broadcast to the call', {
+            callId: this.info.callId,
+            handRaised: this.info.stateData.handRaised
+        })
+    }
+
+    /** Whether a `<video>` fails to advance the sender's own counter past the last one seen. */
+    private isStaleVideoState(transactionId: number | null, last: number | null): boolean {
+        return transactionId !== null && last !== null && transactionId <= last
+    }
+
+    /**
+     * Moves the upgrade handshake on the peer's state: a request is only recorded, a terminal
+     * code settles ours. Every code but `Enabled` clears the peer's outstanding request.
      */
     private applyPeerUpgradeState(state: number): void {
         switch (state) {
@@ -1440,12 +2421,7 @@ export class WaCallMediaSession {
                 if (this.pendingVideoUpgrade) {
                     this.openVideoSendPath()
                     this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.Accepted)
-                    // Announced once the sender exists, under our own counter: the id of
-                    // an inbound message belongs to the peer's numbering and reusing it
-                    // would emit a number below one we already sent.
-                    // Swallowed: the send logs its own failure, and an unhandled
-                    // rejection ends the process, taking every live call with it.
-                    void this.sendVideoState(WA_VIDEO_STATE.Enabled).catch(() => {})
+                    this.sendVideoStateDetached(WA_VIDEO_STATE.Enabled)
                 }
                 return
 
@@ -1469,17 +2445,11 @@ export class WaCallMediaSession {
                 this.peerVideoUpgradeRequested = false
                 return
 
-            /** Peer camera on: releases our video held after the peer's upgrade. */
             case WA_VIDEO_STATE.Enabled:
                 this.peerVideoReadyGate.markPeerReady('upgrade')
                 return
 
-            /**
-             * A camera going off, and also how a peer takes back a request nobody
-             * answered in time - measured, and it is what this side sends for that too.
-             * Left outstanding, the next {@link acceptVideoUpgrade} would announce video
-             * against a peer that has gone back to audio and stopped listening.
-             */
+            // Also how a peer takes back a request nobody answered in time.
             case WA_VIDEO_STATE.Disabled:
                 this.peerVideoUpgradeRequested = false
                 return
@@ -1490,17 +2460,12 @@ export class WaCallMediaSession {
     }
 
     /**
-     * Asks the peer to turn this audio call into a video call, and resolves with how that
-     * ended. **No video RTP leaves until the peer accepts**: the accept is what opens the
-     * local sender. The request goes out as `UpgradeRequestV2`, the 1:1 code -
-     * `UpgradeRequest` is the group one. A crossing request answers the peer's instead of
-     * sending a second, and a second call while one is in flight joins it. Throws when the
-     * call is not active or already carries video.
-     *
-     * Nothing has to be added to `<capability>`: the peer gates the upgrade on indices 4
-     * and 11, which an audio offer already carries. Order derived, not captured.
+     * Asks the peer to turn this audio call into video, resolving with the outcome; no video
+     * leaves until it accepts. A crossing request is answered instead, a second call joins the
+     * first. @throws when the call is not active or already carries video.
      */
     async requestVideoUpgrade(): Promise<WaVideoUpgradeResult> {
+        if (this.isGroupCall) return this.requestGroupVideoUpgrade()
         if (!this.info.isActive) {
             throw new Error(`Call ${this.info.callId} is not active`)
         }
@@ -1522,17 +2487,14 @@ export class WaCallMediaSession {
         const timer = setTimeout(() => {
             this.onVideoUpgradeTimeout()
         }, WA_VIDEO_UPGRADE_TIMEOUT_MS)
-        // A guard timer must not keep an otherwise idle program alive.
         timer.unref?.()
 
-        // Armed before the request leaves: the peer can answer while the send is still
-        // unwinding, and an answer with no attempt recorded is dropped as stray.
+        // Armed before the request leaves: the peer can answer while the send still unwinds.
         this.pendingVideoUpgrade = { timer, settle, promise }
 
         try {
             await this.sendVideoState(WA_VIDEO_STATE.UpgradeRequestV2)
         } catch (err) {
-            // Settled only for a second caller that joined this attempt; the first throws.
             this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.Failed)
             throw err
         }
@@ -1546,17 +2508,8 @@ export class WaCallMediaSession {
     }
 
     /**
-     * Accepts an upgrade the peer asked for, concluding the handshake and opening the
-     * local video sender. No-op when the peer has nothing outstanding: accepting a
-     * request never made would announce video on a call the peer thinks is audio.
-     *
-     * The camera is announced after the accept and after the sender is open, the order the
-     * requesting side follows too: `Enabled` claims video is on the wire, so it may not
-     * leave before there is a sender, and the sender may not open before the peer knows
-     * the upgrade was accepted.
-     *
-     * Our frames are then held until the peer's camera is on, plus a guard, or three
-     * seconds at most; see {@link WaPeerVideoReadyGate}. An upgrade we asked for is not held.
+     * Accepts the peer's upgrade request: the accept, then our sender, then `Enabled`, our frames
+     * held by {@link WaPeerVideoReadyGate}. No-op when the peer has nothing outstanding.
      */
     async acceptVideoUpgrade(): Promise<void> {
         if (!this.peerVideoUpgradeRequested) return
@@ -1566,8 +2519,6 @@ export class WaCallMediaSession {
         try {
             await this.sendVideoState(WA_VIDEO_STATE.UpgradeAccept)
         } catch (err) {
-            // The request is still outstanding if the accept never left, and the caller is
-            // told so: cleared here, a retry would no-op and the peer would wait forever.
             this.restorePeerRequest(seen)
             throw err
         }
@@ -1575,9 +2526,7 @@ export class WaCallMediaSession {
         // Held before the sender opens, so the plan that opens it already holds it.
         this.peerVideoReadyGate.hold('upgrade')
         this.openVideoSendPath()
-        // Best effort, unlike the accept: by this point the peer has accepted and the
-        // sender is open, so rejecting here would report an upgrade that did happen as
-        // having failed. The send logs its own failure.
+        // Best effort: the upgrade did happen, so a failed announcement is only logged.
         await this.sendVideoState(WA_VIDEO_STATE.Enabled).catch(() => {})
 
         this.logger.debug('video upgrade accepted', { callId: this.info.callId })
@@ -1592,8 +2541,6 @@ export class WaCallMediaSession {
         try {
             await this.sendVideoState(WA_VIDEO_STATE.UpgradeReject)
         } catch (err) {
-            // As in acceptVideoUpgrade: a refusal that never left leaves the peer's
-            // request outstanding, and clearing it would make the retry a no-op.
             this.restorePeerRequest(seen)
             throw err
         }
@@ -1601,14 +2548,7 @@ export class WaCallMediaSession {
         this.logger.debug('video upgrade rejected', { callId: this.info.callId })
     }
 
-    /**
-     * Puts back the peer request an answer cleared, when that answer never left.
-     *
-     * Only when the peer has said nothing since: sending yields, and a withdrawal that
-     * lands in that gap already cleared the request for good. Restoring it then would let
-     * a later accept open the video sender against a peer back on audio - the same state
-     * an unhandled `Disabled` used to leave behind.
-     */
+    /** Puts back the peer request an answer that never left cleared, unless the peer spoke since. */
     private restorePeerRequest(seen: number): void {
         if (this.peerVideoStateSeen !== seen) return
         this.peerVideoUpgradeRequested = true
@@ -1618,12 +2558,7 @@ export class WaCallMediaSession {
     async cancelVideoUpgrade(): Promise<void> {
         if (!this.pendingVideoUpgrade) return
 
-        /**
-         * No rollback here, unlike accepting and rejecting: those clear a flag, which can
-         * be put back, while this settles the caller's promise, which cannot be unsettled.
-         * A cancel that fails to leave costs the peer nothing - its own guard timer expires
-         * and it withdraws the request itself.
-         */
+        // No rollback: the promise is settled for good, and the peer's own timer ends its wait.
         this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.Cancelled)
         await this.sendVideoState(WA_VIDEO_STATE.UpgradeCancel)
 
@@ -1631,33 +2566,28 @@ export class WaCallMediaSession {
     }
 
     /**
-     * Ends a request the peer never answered: this side stops waiting and the call stays
-     * audio.
-     *
-     * The withdrawal travels as `Disabled`, **not** as `UpgradeCancelByTimeout`, whose
-     * name invites exactly that swap: the peer's own timer runs a downgrade too, and the
-     * cancel codes belong to a deliberate withdrawal ({@link cancelVideoUpgrade}).
-     * Nothing is sent once the request is no longer outstanding.
+     * Ends a request the peer never answered, the call staying audio. The withdrawal is
+     * `Disabled`, not `UpgradeCancelByTimeout`: the cancel codes are a deliberate withdrawal.
      */
     private onVideoUpgradeTimeout(): void {
         if (!this.pendingVideoUpgrade) return
+        if (this.isGroupCall) {
+            this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.TimedOut)
+            this.logger.debug('group video upgrade timed out', { callId: this.info.callId })
+            return
+        }
 
         this.settleVideoUpgrade(WA_VIDEO_UPGRADE_RESULT.TimedOut)
-        // The `Disabled` closes a request of the peer that crossed ours, too.
         this.peerVideoUpgradeRequested = false
         this.logger.debug('video upgrade timed out, staying on audio', {
             callId: this.info.callId,
             timeoutMs: WA_VIDEO_UPGRADE_TIMEOUT_MS
         })
 
-        // Swallowed: logged inside, and an unhandled rejection ends the process.
-        void this.sendVideoState(WA_VIDEO_STATE.Disabled).catch(() => {})
+        this.sendVideoStateDetached(WA_VIDEO_STATE.Disabled)
     }
 
-    /**
-     * Settles the request in flight, if any, and drops it. Every path that ends a
-     * handshake goes through here, which is what keeps the resolver single-use.
-     */
+    /** Settles and drops the request in flight; every path ending a handshake comes here. */
     private settleVideoUpgrade(result: WaVideoUpgradeResult): void {
         const pending = this.pendingVideoUpgrade
         if (!pending) return
@@ -1667,18 +2597,12 @@ export class WaCallMediaSession {
         pending.settle(result)
     }
 
-    /**
-     * Sends one `<video>` of our own, numbered with the next id of our own counter.
-     *
-     * The counter belongs to this side alone and only advances; an id read off an inbound
-     * `<video>` is never reused, since the peer numbers its messages on its own counter and
-     * drops anything of ours that does not move past the last id we sent.
-     */
+    /** Sends one `<video>`, numbered by our own counter, never by an id the peer sent. */
     private async sendVideoState(state: number): Promise<void> {
         this.videoStateTransactionId++
         const id = this.videoStateTransactionId
         const node = buildVideoStateStanza(
-            this.acceptedByJid ?? this.info.peerJid,
+            this.inCallTarget(),
             this.info.callId,
             this.info.callCreator,
             { state, transactionId: id }
@@ -1696,15 +2620,14 @@ export class WaCallMediaSession {
         }
     }
 
+    /** {@link sendVideoState} for a caller that does not wait: the failure is already logged. */
+    private sendVideoStateDetached(state: number): void {
+        void this.sendVideoState(state).catch(() => {})
+    }
+
     /**
-     * Opens the local video sender on a call negotiated as audio, once both sides have
-     * agreed the upgrade. Until it runs the media drops every video frame.
-     *
-     * Deliberately **not** merged into {@link ensureVideoReceivePath}: the receive path
-     * costs nothing and may open on the first sign of peer video, while this one puts our
-     * video on the wire and may only open on an agreement. It also has the media register
-     * our video SSRCs with the relay, which an audio call never did, or the relay drops
-     * what it does not know. Idempotent, and a no-op on a video call.
+     * Opens our video sender on a call negotiated as audio, once the upgrade is agreed; unlike
+     * {@link ensureVideoReceivePath}, which any sign of peer video opens. Idempotent.
      */
     private openVideoSendPath(): void {
         this.ensureVideoReceivePath()
@@ -1723,10 +2646,7 @@ export class WaCallMediaSession {
         this.logger.debug('video send path opened mid-call', { callId: this.info.callId })
     }
 
-    /**
-     * Records that video is now live on this side, separately from the transport work
-     * around it: this is the only part a call negotiated as video also needs.
-     */
+    /** Records our video as live, the one part a call negotiated as video also needs. */
     private announceVideoLive(): void {
         if (!this.info.stateData.videoOff) return
 
@@ -1742,26 +2662,23 @@ export class WaCallMediaSession {
     }
 
     private get videoSendActive(): boolean {
+        if (this.isGroupCall) return this.groupVideoSending
         return this.info.mediaType === CallMediaType.Video || this.videoSendPathOpened
     }
 
     /**
-     * Opens the video receive path on a call negotiated as audio, so video the peer starts
-     * halfway through has somewhere to land: the media subscribes the relay to the peer's
-     * video streams and opens the video RTP session the key frame request and the
-     * bandwidth estimate ride on. Without them an inbound stream stays a trickle with no
-     * decodable start.
-     *
-     * The local sender stays off - that needs an agreement, {@link openVideoSendPath}.
-     * Idempotent, and a no-op on a video call.
+     * Opens the video receive path on a call negotiated as audio: the peer's video streams and
+     * the RTP session its key frame requests ride on. Our sender stays off. Idempotent.
      */
     private ensureVideoReceivePath(): void {
         if (this.videoReceivePathOpened || this.info.mediaType === CallMediaType.Video) return
         this.videoReceivePathOpened = true
 
-        const peerDeviceJid = this.ensureDeviceJid(this.acceptedByJid ?? this.info.peerJid)
+        const peerDeviceJid = toDeviceJid(this.acceptedByJid ?? this.info.peerJid)
         this.peerVideoStreamSsrcs = this.peerVideoStreamsOf(peerDeviceJid)
         void this.publish({ ssrcs: this.buildSsrcs(), video: this.videoSection() })
+        // Any participant may turn a camera on, so every sender's video gets keyed.
+        if (this.isGroupCall) void this.syncGroupMedia()
 
         this.logger.debug('video receive path opened mid-call', {
             callId: this.info.callId,
@@ -1769,16 +2686,7 @@ export class WaCallMediaSession {
         })
     }
 
-    /**
-     * The media has no relay leg left, and nothing reopens one. What is left is a
-     * call that is live to the manager and mute on the wire.
-     *
-     * The terminate that follows is the ordinary one, the same a hangup sends,
-     * because leaving the peer on a call we cannot carry is that same call
-     * seen from their side. Whether the official client terminates here, and
-     * with which `reason` attribute, is not captured; if it carries one, that
-     * is where it belongs.
-     */
+    /** The media has no relay leg left and nothing reopens one: the call ends as a hangup. */
     private onRelayLost(reason: string): void {
         if (this.info.isEnded) return
 
@@ -1796,6 +2704,14 @@ export class WaCallMediaSession {
             this.info.applyTransition({ type: 'media_connected' })
             this.delegate.emitState(this.info)
             this.announceInitialMuteState()
+            this.startHeartbeat()
+            if (this.isGroupCall && !this.invisibleSweep) {
+                this.invisibleSweep = setInterval(
+                    () => this.sweepInvisibleSenders(),
+                    PEER_INVISIBLE_SWEEP_MS
+                )
+                this.invisibleSweep.unref?.()
+            }
             this.logger.debug('media flowing, call active', { callId: this.info.callId })
         } catch (err) {
             this.logger.trace('call transition skipped', { message: toError(err).message })
@@ -1849,6 +2765,12 @@ export class WaCallMediaSession {
         this.peerVideoReadyGate.cancel()
         this.videoStateTransactionId = 0
         this.acceptedByJid = null
+        if (this.invisibleSweep) clearInterval(this.invisibleSweep)
+        this.invisibleSweep = null
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+        this.heartbeatTimer = null
+        if (this.videoSubscriptionTimer) clearTimeout(this.videoSubscriptionTimer)
+        this.videoSubscriptionTimer = null
     }
 
     /**
@@ -1911,9 +2833,9 @@ export class WaCallMediaSession {
         return this.lastKeys
     }
 
-    private buildSsrcs(): WaCallMediaSsrcs {
+    private buildSsrcs(group?: GroupSenders): WaCallMediaSsrcs {
         const self = this.selfDeviceJid
-        return {
+        const base: WaCallMediaSsrcs = {
             selfAudio: self ? this.ssrcOf(self, WA_SSRC_SLOT.AUDIO.MAIN) : 0,
             selfVideo: self ? this.ssrcOf(self, WA_SSRC_SLOT.VIDEO.MAIN) : 0,
             selfAppData: self ? this.ssrcOf(self, WA_SSRC_SLOT.APP_DATA.MAIN) : 0,
@@ -1924,9 +2846,26 @@ export class WaCallMediaSession {
             peerVideoStreams: [...this.peerVideoStreamSsrcs],
             peerAppData: [...this.peerAppDataSsrcs]
         }
+        if (!this.isGroupCall || !self) return base
+
+        // Every sender's streams and app data, in place of the 1:1 sets.
+        const senders = group ?? this.groupSenders()
+        const peerStreams = new Set<number>()
+        const peerAppData: number[] = []
+        for (const deviceJid of senders.devices) {
+            for (const ssrc of senders.streamsOf(deviceJid)) peerStreams.add(ssrc)
+            peerAppData.push(this.ssrcOf(deviceJid, WA_SSRC_SLOT.APP_DATA.MAIN))
+        }
+        return {
+            ...base,
+            peerStreams: peerStreams.size > 0 ? [...peerStreams] : base.peerStreams,
+            peerAppData: peerAppData.length > 0 ? peerAppData : base.peerAppData,
+            selfLayers: this.derivations.selfStreamLayers(self)
+        }
     }
 
     private relaysSection(): WaCallMediaRelays | null {
+        if (this.adoptedRelays) return this.adoptedRelays
         const relayData = this.info.relayData
         if (!relayData) return null
         return {
@@ -1942,8 +2881,12 @@ export class WaCallMediaSession {
      */
     private videoSection(): WaCallMediaVideo {
         const videoCall = this.info.mediaType === CallMediaType.Video
+        const send =
+            this.isGroupCall && this.groupVideoSend !== null
+                ? this.groupVideoSend
+                : videoCall || this.videoSendPathOpened
         return {
-            send: videoCall || this.videoSendPathOpened,
+            send,
             receive: videoCall || this.videoReceivePathOpened,
             ...(this.peerVideoReadyGate.isHeld && { sendHeld: true })
         }
@@ -1976,8 +2919,8 @@ export class WaCallMediaSession {
             : WA_AUDIO_CALL_SSRC_SLOTS
     }
 
-    private ssrcOf(deviceJid: string, slot?: number): number {
-        return generateSecureSsrc(this.info.callId, deviceJid, slot)
+    private ssrcOf(deviceJid: string, slot = 0): number {
+        return this.derivations.ssrc(deviceJid, slot)
     }
 
     /** The audio and app-data streams of every device listed, each once. */
@@ -2010,16 +2953,6 @@ export class WaCallMediaSession {
             if (this.peerAppDataSsrcs.size >= MAX_TRACKED_PEER_APP_DATA_SSRCS) break
             this.peerAppDataSsrcs.add(this.ssrcOf(jid, WA_SSRC_SLOT.APP_DATA.MAIN))
         }
-    }
-
-    private ensureDeviceJid(jid: string): string {
-        if (/:\d+@/.test(jid)) return jid
-        return jid.replace('@', ':0@')
-    }
-
-    /** Device 0 travels both bare and as `:0`, so device jids compare in one form. */
-    private isSameDevice(left: string, right: string): boolean {
-        return this.ensureDeviceJid(left) === this.ensureDeviceJid(right)
     }
 
     /**
@@ -2089,25 +3022,17 @@ export class WaCallMediaSession {
             return null
         }
 
-        const meLid = this.deps.authClient.getCurrentCredentials()?.meLid
-        const meId = this.deps.authClient.getCurrentCredentials()?.meJid
-        const ourCredJid = meLid || meId || ''
-        const ourBase = toUserJid(ourCredJid)
-        const participants = this.info.relayData?.participantJids || []
-
-        const ourDeviceJid = this.ensureDeviceJid(
-            participants.find((jid) => {
-                const jBase = toUserJid(jid)
-                return jBase === ourBase && /:\d+@/.test(jid)
-            }) || ourCredJid
-        )
-
-        const peerDeviceJid = this.ensureDeviceJid(this.acceptedByJid || this.info.peerJid)
+        const ourDeviceJid = toDeviceJid(this.ourRelayDeviceJid())
+        if (!ourDeviceJid) {
+            this.logger.debug('no own jid, srtp not initialized', { callId: this.info.callId })
+            return null
+        }
+        const peerDeviceJid = toDeviceJid(this.acceptedByJid || this.info.peerJid)
 
         try {
             const keys = this.versionKeys(
-                derivePerJidSrtpKey(callKey, ourDeviceJid),
-                derivePerJidSrtpKey(callKey, peerDeviceJid)
+                this.derivations.srtpKey(callKey, ourDeviceJid),
+                this.derivations.srtpKey(callKey, peerDeviceJid)
             )
             this.logger.debug('srtp per-jid keys initialized', {
                 callId: this.info.callId,
@@ -2123,4 +3048,57 @@ export class WaCallMediaSession {
             return null
         }
     }
+
+    /** Our device as the relay lists it among the participants, else our account jid. */
+    private ourRelayDeviceJid(): string {
+        const ourJid = selfJidOf(this.deps)
+        const ourBase = ourJid ? toUserJid(ourJid) : ''
+        const participants = this.info.relayData?.participantJids || []
+        return participants.find((jid) => toUserJid(jid) === ourBase && /:\d+@/.test(jid)) || ourJid
+    }
+
+    private muteV2Stanza(muted: boolean): BinaryNode {
+        return buildMuteV2Stanza(
+            this.inCallTarget(),
+            this.info.callId,
+            this.info.callCreator,
+            muted
+        )
+    }
+
+    /** Sends a stanza built in the same guard, logging a failure; `false` when it failed. */
+    private async sendLogged(
+        build: () => BinaryNode,
+        failure: string,
+        level: SendLogLevel = 'error',
+        context?: Record<string, unknown>
+    ): Promise<boolean> {
+        try {
+            await this.deps.lowLevelCoordinator.sendNode(build())
+            return true
+        } catch (err) {
+            this.logger[level](failure, {
+                callId: this.info.callId,
+                ...context,
+                message: toError(err).message
+            })
+            return false
+        }
+    }
+
+    /** Sends a stanza nobody waits on; a failure is only logged. */
+    private sendDetached(
+        node: BinaryNode,
+        failure: string,
+        level: SendLogLevel = 'warn',
+        context?: Record<string, unknown>
+    ): void {
+        void this.sendLogged(() => node, failure, level, context)
+    }
+}
+
+/** A group call's sending devices with their streams, shared by one sync's sections. */
+interface GroupSenders {
+    readonly devices: readonly string[]
+    readonly streamsOf: (deviceJid: string) => number[]
 }

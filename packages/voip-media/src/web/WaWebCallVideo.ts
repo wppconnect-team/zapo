@@ -1,8 +1,12 @@
+import { NAL_TYPE_SPS, nalHeaderAfter, nextStartCode } from '../media/h264.js'
 import type { InboundVideoFrame } from '../types.js'
 
 /** The plane method the sender drives; a `WaCallMediaPlane` satisfies it. */
 export interface WaCallVideoSink {
-    /** Sends one H.264 access unit, Annex-B, and returns the RTP packets it went out as. */
+    /**
+     * Sends one H.264 access unit, Annex-B, and returns the RTP packets it went out as.
+     * `data` is only valid during the call: the sender reuses its buffer.
+     */
     sendVideoFrame(data: Uint8Array, timestampUs: number): number
 }
 
@@ -47,6 +51,11 @@ export interface WaWebCallVideoReceiverOptions {
     readonly hardwareAcceleration?: HardwareAcceleration
     /** A decoder failure; the stream resumes on its next key frame. */
     readonly onError?: (error: unknown, ssrc: number) => void
+    /**
+     * Streams decoded at once, 4 by default; the oldest is closed to make room. A group call
+     * shows one per sender.
+     */
+    readonly maxStreams?: number
 }
 
 export interface WaWebCallVideoReceiverStats {
@@ -80,8 +89,8 @@ const MAX_ENCODE_QUEUE = 2
 /** Decoder backlog past which the stream is cut back to its next key frame. */
 const MAX_DECODE_QUEUE = 30
 
-/** Peer streams decoded at once; the oldest is closed to make room. */
-const MAX_DECODED_STREAMS = 4
+/** Peer streams decoded at once by default; the oldest is closed to make room. */
+const DEFAULT_MAX_DECODED_STREAMS = 4
 
 /** RTP clock rate of H.264. */
 const VIDEO_CLOCK_KHZ = 90
@@ -91,8 +100,6 @@ const VIDEO_CLOCK_KHZ = 90
  * the encoder restarted on a new timestamp base.
  */
 const MAX_TIMESTAMP_STEP_TICKS = 10_000 * VIDEO_CLOCK_KHZ
-
-const NAL_TYPE_SPS = 7
 
 interface VideoFrameSource {
     /** The next frame, or `null` once the track ended or the source was closed. */
@@ -129,6 +136,7 @@ export class WaWebCallVideoSender {
     private lastKeyFrameAtUs: number | null = null
     private keyFrameRequested = false
     private stopped = false
+    private chunkScratch = new Uint8Array(0)
     private framesCaptured = 0
     private framesEncoded = 0
     private framesSent = 0
@@ -319,7 +327,10 @@ export class WaWebCallVideoSender {
 
     private onChunk(chunk: EncodedVideoChunk): void {
         if (this.stopped) return
-        const data = new Uint8Array(chunk.byteLength)
+        if (this.chunkScratch.length < chunk.byteLength) {
+            this.chunkScratch = new Uint8Array(chunk.byteLength)
+        }
+        const data = this.chunkScratch.subarray(0, chunk.byteLength)
         chunk.copyTo(data)
         this.framesEncoded++
         if (chunk.type === 'key') this.keyFrames++
@@ -367,6 +378,7 @@ export class WaWebCallVideoReceiver {
     private readonly onFrameDecoded: (frame: VideoFrame, ssrc: number) => void
     private readonly onError: ((error: unknown, ssrc: number) => void) | undefined
     private readonly hardwareAcceleration: HardwareAcceleration | undefined
+    private readonly maxStreams: number
     private readonly streams = new Map<number, DecodedStream>()
     private closed = false
     private framesReceived = 0
@@ -382,6 +394,10 @@ export class WaWebCallVideoReceiver {
         this.onFrameDecoded = options.onFrame
         this.onError = options.onError
         this.hardwareAcceleration = options.hardwareAcceleration
+        const maxStreams = options.maxStreams ?? DEFAULT_MAX_DECODED_STREAMS
+        this.maxStreams = Number.isFinite(maxStreams)
+            ? Math.max(1, Math.trunc(maxStreams))
+            : DEFAULT_MAX_DECODED_STREAMS
     }
 
     get stats(): WaWebCallVideoReceiverStats {
@@ -448,7 +464,7 @@ export class WaWebCallVideoReceiver {
     private streamFor(ssrc: number): DecodedStream {
         let stream = this.streams.get(ssrc)
         if (stream) return stream
-        if (this.streams.size >= MAX_DECODED_STREAMS) {
+        if (this.streams.size >= this.maxStreams) {
             const [oldestSsrc, oldest] = this.streams.entries().next().value as [
                 number,
                 DecodedStream
@@ -616,16 +632,12 @@ function advanceTimestamp(stream: DecodedStream, rtpTimestamp: number): number {
 
 /** The WebCodecs codec string read off an access unit's SPS, or `null` without one. */
 export function readH264Codec(data: Uint8Array): string | null {
-    for (let i = 0; i + 3 < data.length; i++) {
-        if (data[i] !== 0 || data[i + 1] !== 0) continue
-        let header = -1
-        if (data[i + 2] === 1) header = i + 3
-        else if (data[i + 2] === 0 && data[i + 3] === 1) header = i + 4
-        if (header < 0) continue
+    for (let at = nextStartCode(data, 0); at >= 0; ) {
+        const header = nalHeaderAfter(data, at)
         if (header + 3 < data.length && (data[header] & 0x1f) === NAL_TYPE_SPS) {
             return `avc1.${hexByte(data[header + 1])}${hexByte(data[header + 2])}${hexByte(data[header + 3])}`
         }
-        i = header - 1
+        at = nextStartCode(data, header)
     }
     return null
 }
