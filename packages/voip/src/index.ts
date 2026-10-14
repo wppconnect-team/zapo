@@ -1,11 +1,29 @@
-export { WA_APP_DATA_PAYLOAD_TYPE } from '@zapo-js/voip-media'
+export { WA_APP_DATA_PAYLOAD_TYPE, WA_VIDEO_QUALITY } from '@zapo-js/voip-media'
 export type { WaCallArEffect, WaCallReaction } from '@zapo-js/voip-media'
 export { voipPlugin } from './plugin.js'
 export type { VoipPluginOptions } from './plugin.js'
 export type { WaVoipMediaApi } from './WaVoipCoordinator.js'
 
-export { CallInfo } from './call/call-state.js'
-export type { CallStateData } from './call/call-state.js'
+export { CallInfo, WA_GROUP_CALL_ENDED_REASON } from './call/call-state.js'
+export type { CallStateData, WaCallParticipantMedia } from './call/call-state.js'
+
+export { groupSenderId } from './call/group-media-plan.js'
+
+export {
+    WA_CALL_PARTICIPANT_STATE,
+    WA_GROUP_REKEY_REASON,
+    WA_GROUP_REMOVAL_CAUSE
+} from './call/group-participants.js'
+export type {
+    WaCallGroupParticipant,
+    WaGroupComposition,
+    WaGroupCompositionDiff,
+    WaGroupDeviceChange,
+    WaGroupDeviceSwitch,
+    WaGroupRekeyReason,
+    WaGroupRemoval,
+    WaGroupRemovalCause
+} from './call/group-participants.js'
 
 export {
     WA_SCREEN_SHARE_SEND_VERSION,
@@ -15,6 +33,7 @@ export {
 export type { PeerScreenShare } from './signaling/screen-share.js'
 
 export {
+    WA_MUTE_REQUEST_STATE,
     WA_VIDEO_STATE,
     WA_VIDEO_UPGRADE_RESULT,
     WA_VIDEO_UPGRADE_TIMEOUT_MS
@@ -27,7 +46,11 @@ export { CallState, CallDirection, CallMediaType, EndCallReason } from './types.
 
 export type {
     CallOfferOptions,
+    CallOfferParticipant,
     CallManagerEvents,
+    CallVideoSubscription,
+    GroupCallOfferOptions,
+    OneToOneCallOfferOptions,
     InboundVideoFrame,
     InboundVideoRtpPacket,
     PeerVideoStateChange

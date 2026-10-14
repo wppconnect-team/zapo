@@ -1,7 +1,6 @@
 import {
     bytesToHex,
     concatBytes,
-    readBigUInt64BE,
     readUInt16BE,
     readUInt32BE,
     TEXT_DECODER,
@@ -11,6 +10,8 @@ import {
 import type { WaMediaCrypto } from '../crypto/primitives.js'
 import { randomBytes } from '../crypto/random.js'
 import { encodeProtoLengthDelimited, encodeProtoVarintField } from '../protobuf.js'
+
+import { isWarpFramedPacket, warpFrameHeaderLength } from './warp-frame.js'
 
 const STUN_MAGIC_COOKIE = 0x2112a442
 const STUN_FINGERPRINT_XOR = 0x5354554e
@@ -26,15 +27,11 @@ const ATTR_XOR_RELAYED_ADDRESS = 0x0016
 const ATTR_PRIORITY = 0x0024
 
 /**
- * The relay credential: the `<relay>` token, raw bytes, not text.
- *
- * It is not a subscription attribute despite the `SENDER-SUBSCRIPTIONS` label
- * that circulated for it. The real subscription attributes are
- * `SENDER-SUBSCRIPTIONS` (0x4025) and `RECEIVER-SUBSCRIPTION` (0x4021), neither
- * of which this file emits. Treating 0x4000 as a droppable subscription blob
- * and replacing it with a `USERNAME` cost every allocate on the wire.
+ * On an allocate, the relay credential: the raw `<relay>` token, never a `USERNAME`. Binding
+ * requests carry {@link buildSenderSubscriptions} in it instead.
  */
 const ATTR_RELAY_CREDENTIAL = 0x4000
+const ATTR_RX_SUBSCRIPTIONS = 0x4021
 const ATTR_SSRC_LIST = 0x4024
 const ATTR_ICE_CONTROLLING = 0x802a
 const ATTR_FINGERPRINT = 0x8028
@@ -57,22 +54,8 @@ const XOR_RELAYED_IPV4_BYTES = 4 + IPV4_ADDRESS_BYTES
 const XOR_RELAYED_IPV6_BYTES = 4 + IPV6_ADDRESS_BYTES
 
 /**
- * Creates the 12-byte transaction id of a relay connection.
- *
- * The id is stable per connection, not per message. This is a parity decision,
- * not an oversight: reverse engineering the official client shows that the STUN
- * message init routine generates no id at all, it only copies a 12-byte field
- * off the connection object into the header at +8, and every builder reads that
- * same source. Since the XOR key of the IPv6 `XOR-RELAYED-ADDRESS` derives from
- * the id sitting in the header, the id that masks the address is always that
- * connection id.
- *
- * Where the official client derives the value from is still unknown: the write
- * site sits in connection init and does not show up in the dumps. What is
- * implemented here is the simplest hypothesis, that the relay demands
- * consistency and nothing more. If the IPv6 legs keep answering 452 after this
- * change, the conclusion is that the relay demands a value derived from
- * something it knows as well, and stability on its own is not enough.
+ * Creates the 12-byte transaction id of a relay connection: stable per connection, not per
+ * message, as the official client does. It also keys the IPv6 `XOR-RELAYED-ADDRESS`.
  */
 export function createStunTransactionId(): Uint8Array {
     return randomBytes(TRANSACTION_ID_LENGTH)
@@ -173,6 +156,71 @@ export function buildSenderSubscriptions(ssrc: number): Uint8Array {
     return encodeProtoLengthDelimited(1, inner)
 }
 
+/** One stream this side sends: its layer and its SSRCs in payload order (media, FEC, NACK). */
+export interface StreamLayerSsrcs {
+    readonly layer: number
+    readonly ssrcs: readonly number[]
+}
+
+/** Field 2 of a descriptor entry, read off the SSRC's position in its stream. */
+const STREAM_PAYLOAD_TYPE_BY_POSITION = [0, 1, 2] as const
+
+/** The app-data layer has one stream, declared under payload type 4 rather than by position. */
+const STREAM_LAYER_APP_DATA = 5
+const APP_DATA_PAYLOAD_TYPES = [4] as const
+
+/**
+ * Builds the self-only `0x4024` stream descriptor: one `{1: layer, 2: payload type, 3: ssrc}`
+ * entry per SSRC, fields at their default omitted and field 4 never written. A zero SSRC drops
+ * its entry without shifting the rest, and positions past NACK are dropped (past the first on
+ * the app-data layer).
+ */
+export function buildStreamDescriptor(layers: readonly StreamLayerSsrcs[]): Uint8Array {
+    const entries: Uint8Array[] = []
+
+    for (const { layer, ssrcs } of layers) {
+        const payloadTypes =
+            layer === STREAM_LAYER_APP_DATA
+                ? APP_DATA_PAYLOAD_TYPES
+                : STREAM_PAYLOAD_TYPE_BY_POSITION
+        const count = Math.min(ssrcs.length, payloadTypes.length)
+        for (let position = 0; position < count; position++) {
+            const ssrc = ssrcs[position]
+            if (!ssrc) continue
+            const payloadType = payloadTypes[position]
+            const fields: Uint8Array[] = []
+            if (layer !== 0) fields.push(encodeProtoUint32Field(1, layer))
+            if (payloadType !== 0) fields.push(encodeProtoUint32Field(2, payloadType))
+            fields.push(encodeProtoUint32Field(3, ssrc))
+            entries.push(encodeProtoLengthDelimited(1, concatBytes(fields)))
+        }
+    }
+
+    return concatBytes(entries)
+}
+
+/** One participant whose video this side asks the relay for, at a `VideoQuality` value. */
+export interface RxVideoSubscription {
+    readonly pid: number
+    readonly quality: number
+}
+
+/**
+ * Builds the `0x4021` `RxSubscriptions`: one field-2 `{1: pid, 2: quality}` entry per
+ * participant, fields at their default omitted. Field 1 (`vid_rx_pids`) is never written.
+ */
+export function buildRxSubscriptions(infos: readonly RxVideoSubscription[]): Uint8Array {
+    const entries: Uint8Array[] = []
+    for (const { pid, quality } of infos) {
+        const fields: Uint8Array[] = []
+        if (pid !== 0) fields.push(encodeProtoUint32Field(1, pid))
+        if (quality !== 0) fields.push(encodeProtoUint32Field(2, quality))
+        entries.push(encodeProtoLengthDelimited(2, concatBytes(fields)))
+    }
+    return concatBytes(entries)
+}
+
+/** The 1:1 `0x4024`: every self and peer SSRC under its participant id, payload type 1. */
 export function buildSSRCSubscriptionList(
     selfSsrcs: number[],
     peerSsrcs: number[],
@@ -349,26 +397,8 @@ function writeIpv6Address(text: string, out: Uint8Array, offset: number): boolea
 }
 
 /**
- * Applies, in place, the IPv6 address XOR key over the 12 bytes of `data` that
- * start at `offset`.
- *
- * The key is not the transaction id as it travels in the header: it is that
- * same id read as three 32-bit words, each one with its bytes reversed. The
- * order was recovered by algebra over two real connections, not deduced from
- * the RFC: the relay echoes back inside the 452 error the address it decoded,
- * and `decoded XOR actual XOR header_id` yields the key it in fact used. Both
- * samples match that order exactly; reversing the whole 12 bytes, or swapping
- * the bytes two at a time, fails on both. The reading is an endianness
- * divergence at a single point: one side treats the id as three host-order
- * uint32s, the other as bytes.
- *
- * The header still carries the id with no swap at all, and STUN responses echo
- * back exactly the value that was sent, so the only thing that diverges is the
- * key.
- *
- * The falsifiable prediction is the IPv6 legs moving from 452 to SUCCESS. If
- * they stay on 452, the pattern was a coincidence of the two samples and this
- * byte order has to be withdrawn.
+ * XORs, in place, the 12 bytes at `offset` with the IPv6 key: the transaction id read as three
+ * 32-bit words, each byte-reversed. The header itself carries the id unswapped.
  */
 function xorWithRelayKeyByteOrder(
     data: Uint8Array,
@@ -383,17 +413,8 @@ function xorWithRelayKeyByteOrder(
 }
 
 /**
- * Encodes the relay's own endpoint as the RFC 5389 `XOR-RELAYED-ADDRESS` the
- * relay matches against the socket the allocate arrived on. Both families share
- * the 0x0016 attribute type and differ only in the family byte and the XOR key:
- * IPv4 masks its 4 address bytes with the magic cookie, IPv6 masks its 16 with
- * the cookie followed by the transaction id of the message being built, in the
- * byte order the relay expects in the key (see `xorWithRelayKeyByteOrder`),
- * which is why the transaction id has to be threaded in from the header.
- *
- * Announcing the wrong family is worse than announcing nothing: an IPv6 relay
- * told `0.0.0.0` answers every allocate with a 452 mismatch and forwards no
- * media, so an address that does not parse yields no attribute at all.
+ * Encodes the relay's own endpoint as the `XOR-RELAYED-ADDRESS` it matches the allocate's socket
+ * against. An address that does not parse yields no attribute: a wrong family is answered 452.
  */
 function encodeXorRelayedAddress(
     ip: string,
@@ -425,26 +446,9 @@ function encodeXorRelayedAddress(
 }
 
 /**
- * Builds the relay ALLOCATE request, the handshake that opens the media
- * connection. It is not optional: without an allocate success the relay
- * forwards no RTP, and the `0x0801`/`0x0802` ping-pong is only keepalive on a
- * connection the allocate already created.
- *
- * Two distinct credential schemes meet on this socket, and they do not mix:
- *
- * - ICE connectivity checks authenticate with `USERNAME` (0x0006), holding
- *   `remote-ufrag:local-ufrag`, plus MESSAGE-INTEGRITY keyed with the ice-pwd.
- * - This allocate authenticates with the relay token, raw bytes, in
- *   `ATTR_RELAY_CREDENTIAL` (0x4000), plus MESSAGE-INTEGRITY keyed with the
- *   `<relay>` key. It carries no `USERNAME`.
- *
- * Sending the ICE scheme here, a text `USERNAME` in place of the raw token, is
- * answered with a 456 and drops every inbound media packet.
- *
- * `relayCredential` is `relayInfo.rawToken` and `hmacKey` the raw `<relay>` key
- * bytes. `transactionId` is the id of the connection this allocate belongs to,
- * and it lands both in the header and in the IPv6 XOR key; leaving it out is
- * only correct outside a connection, where a one-off id is all there is.
+ * Builds the relay ALLOCATE, without which the relay forwards no media. It authenticates with the
+ * raw token in 0x4000 and MESSAGE-INTEGRITY keyed with `hmacKey`; a `USERNAME` is answered 456.
+ * `transactionId` is the connection's; `rxSubscriptions` goes between credential and SSRC list.
  */
 export function buildAllocateForRelay(
     crypto: WaMediaCrypto,
@@ -453,11 +457,15 @@ export function buildAllocateForRelay(
     hmacKey: Uint8Array,
     relayIp?: string,
     relayPort?: number,
-    transactionId: Uint8Array = createStunTransactionId()
+    transactionId: Uint8Array = createStunTransactionId(),
+    rxSubscriptions?: Uint8Array | null
 ): Uint8Array {
     const parts: Uint8Array[] = []
 
     parts.push(encodeAttribute(ATTR_RELAY_CREDENTIAL, relayCredential))
+    if (rxSubscriptions && rxSubscriptions.length > 0) {
+        parts.push(encodeAttribute(ATTR_RX_SUBSCRIPTIONS, rxSubscriptions))
+    }
     parts.push(encodeAttribute(ATTR_SSRC_LIST, ssrcList))
 
     if (relayIp && relayPort) {
@@ -479,17 +487,8 @@ export function buildAllocateForRelay(
 }
 
 /**
- * Builds an ICE connectivity-check binding request.
- *
- * This is the ICE credential path: `username` is `remote-ufrag:local-ufrag` and
- * `hmacKey` the ice-pwd, unlike the allocate above, which authenticates with
- * the raw relay token. `senderSubscriptions` rides in the 0x4000 attribute,
- * which the allocate uses for the relay credential; the shape validated against
- * a live relay puts the subscription protobuf there on binding requests, so it
- * stays that way.
- *
- * `transactionId` is the id of the connection this check belongs to; leaving it
- * out is only correct outside a connection, where a one-off id is all there is.
+ * Builds an ICE binding request: `username` is `remote-ufrag:local-ufrag`, `hmacKey` the ice-pwd,
+ * and `senderSubscriptions` rides in 0x4000. `transactionId` is the connection's.
  */
 export function buildBindingRequestWithSubs(
     crypto: WaMediaCrypto,
@@ -530,12 +529,7 @@ export function buildBindingRequestWithSubs(
     )
 }
 
-/**
- * Builds the bare 0x0801 keepalive the relay answers with a 0x0802 pong.
- *
- * `transactionId` is the id of the connection being kept alive; leaving it out
- * is only correct outside a connection, where a one-off id is all there is.
- */
+/** Builds the bare 0x0801 keepalive the relay answers with a 0x0802 pong. */
 export function buildWhatsAppPing(
     transactionId: Uint8Array = createStunTransactionId()
 ): Uint8Array {
@@ -547,12 +541,22 @@ export function buildWhatsAppPing(
     return header
 }
 
+/**
+ * Whether a datagram is STUN control. Decided by the magic cookie, or the cookieless ping and
+ * pong types; a WARP frame shares STUN's clear high bits and is never STUN, whatever its bytes.
+ */
 export function isStunPacket(data: Uint8Array): boolean {
     if (data.length < 2) return false
     if ((data[0] & 0xc0) !== 0) return false
+    if (isWarpFramedPacket(data)) return false
     const type = readUInt16BE(data, 0)
     if (type === WHATSAPP_PING || type === WHATSAPP_PONG) return true
     return data.length >= 8 && readUInt32BE(data, 4) === STUN_MAGIC_COOKIE
+}
+
+/** Whether a datagram is the relay's 0x0802 pong, as {@link parseStunResponse} reads one. */
+export function isWaPong(data: Uint8Array): boolean {
+    return data.length >= 20 && readUInt16BE(data, 0) === WHATSAPP_PONG
 }
 
 export function isRtpPacket(data: Uint8Array): boolean {
@@ -574,7 +578,6 @@ export interface StunResponseInfo {
     isError: boolean
     errorCode?: number
     errorReason?: string
-    stableRoutingConnId?: bigint
     transactionId: string
     length: number
     attributes: StunAttribute[]
@@ -671,7 +674,6 @@ export function parseStunResponse(data: Uint8Array): StunResponseInfo | null {
     const attributes: StunAttribute[] = []
     let errorCode: number | undefined
     let errorReason: string | undefined
-    let stableRoutingConnId: bigint | undefined
     let offset = 20
 
     while (offset + 4 <= 20 + msgLength && offset + 4 <= data.length) {
@@ -698,10 +700,6 @@ export function parseStunResponse(data: Uint8Array): StunResponseInfo | null {
             }
         }
 
-        if (attrType === 0x4033 && stunClass === 'success' && attrLength === 8) {
-            stableRoutingConnId = readBigUInt64BE(attrData, 0)
-        }
-
         offset = attrEnd + ((4 - (attrLength % 4)) % 4)
     }
 
@@ -713,7 +711,6 @@ export function parseStunResponse(data: Uint8Array): StunResponseInfo | null {
         isError: stunClass === 'error',
         errorCode,
         errorReason,
-        stableRoutingConnId,
         transactionId,
         length: data.length,
         attributes
@@ -741,6 +738,10 @@ export function classifyPacket(data: Uint8Array): string {
 
     const firstByte = data[0]
     const twoBits = (firstByte & 0xc0) >> 6
+
+    if (isWarpFramedPacket(data)) {
+        return `WARP frame hdr=${warpFrameHeaderLength(data)} (${data.length}B)`
+    }
 
     if (twoBits === 0) {
         const info = parseStunResponse(data)
