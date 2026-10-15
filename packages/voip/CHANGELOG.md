@@ -1,5 +1,45 @@
 # @zapo-js/voip
 
+## 1.4.0
+
+### Minor Changes
+
+- 1ebadd9: Place, answer, follow and leave group calls.
+
+    `startCall({ groupJid, participants })` places a group call, addressed to the call itself, and `leaveCall(callId)` steps out of one. On a group call `endCall` does the same, as no member can end one for everybody: both send one terminate to the call itself, with its duration once it connected, and the call ends when its last member leaves. A group call we place connects when the server's roster lists another participant connected. An incoming group call carries `call.groupJid`, `call.joinable` and `call.groupComposition`, and every change of who is on it arrives on `voip_call_participants_changed`. A participant's terminate takes only that participant off an established group call; a terminate on a call we are still joining, and one for a group call not yet offered, keeps the call, and the terminates that arrive for a call after it ended here are dropped.
+
+    The call key arrives over `enc_rekey`, answered with a receipt and held when it beats its offer; when the server makes this side the rekey master, it mints the key and sends it to every connected device. The media plan carries one key per remote device, declares our streams by layer, and follows the relay the server moves the call to, or re-credits: over raw UDP when it carries no ICE credential, the ordinary way when it does. A remote media host that cannot carry a group call is reported on `voip_call_error`.
+
+    An offer the server refuses with an error ack no longer leaves the call ringing, on 1:1 calls too: it ends with the new `EndCallReason.SetupFailed`, and the peer, or the call itself on a group call, is sent a `setup_failed` terminate.
+
+- 1ebadd9: Mute, raise hand, reactions, video and screen share on group calls, each attributed to the participant's device.
+
+    `voip_call_peer_mute`, `voip_call_peer_video_state`, `voip_call_screen_share`, `voip_call_reaction`, `voip_call_inbound_video` and `voip_call_inbound_video_rtp` carry the sending device in `participantJid`, and the manager-level events take it as a trailing argument, so existing listeners keep working. New events: `voip_call_mute_requested` (a participant asked this side to mute; nothing is applied), `voip_call_participant_media` (a participant's media started or stopped arriving), `voip_call_video_upgraded` (a participant turned the call into a video call) and, with the new `participantAudio` option, `voip_call_participant_audio`. New methods: `requestParticipantMute`, `setVideoEnabled`, `setVideoSubscriptions` and `joinCall`, and `requestVideoUpgrade` on a group call asks the server to turn the whole call into a video call. `groupSenderId`, `WA_MUTE_REQUEST_STATE`, `WA_VIDEO_QUALITY` and the `CallVideoSubscription` type are exported.
+
+    A screen share start or stop now carries `screen_share_id`, counted per call from 1, as the official clients send it. A group callee now preaccepts and declines to the call itself, the decline with `count='0'`, so the others list it as invited instead of still ringing. A 1:1 call that grows into a group call by inviting this side is answered as a group call, although its offer names no group. `group_call_ended` ends a group call in any state; the server ending our unanswered ring ends the call here with `EndCallReason.Timeout` and sends nothing, and a re-ring of a call declined or rung out here arrives as a new incoming call.
+
+    `joinCall(callId)` joins a group call in progress that this side declined, let ring out or left: one accept to the call itself, with the relay and the rekey coming in the server's answer, whose ack is matched to the call by the address it comes from. `joinable` no longer marks a call as a group call, since WhatsApp Web offers its 1:1 calls joinable too: such a call keeps the 1:1 rules and is never remembered for a join.
+
+- 1ebadd9: Stay on group calls the way the official clients do, and leave them cleanly when the server takes this side off.
+
+    A group call now sends the call a heartbeat while this side is on it, every 10 s by default (`heartbeat_interval_s`), and reports to the server a member none of whose media has reached this side for about 20 seconds (`peer_state`, invisible), as every member does. When the server takes this side off a call for the same reason (`user_invisible`), the call ends here at once with the new `EndCallReason.Invisible` instead of staying active with no media, nothing is sent, and the call can be joined again with `joinCall`.
+
+- caeace8: Read every applied `<voip_settings>` key in one place, and stop copying inbound audio nobody listens to.
+
+    `WaVoipSettings` exposes each key the call applies as a typed field, read once when the settings are parsed: besides `disableRtcpRemb`, `rtcpIntervalMs`, `audioFrameMs` and `audioMaxFramesPerPacket`, now `videoStateTxnRecvEnforce`, `heartbeatIntervalMs`, `appDataStream`, `appDataStreamVersion`, `sframe` and `sframeRx`. `getFlag`, `getNumber` and `getText` are unchanged.
+
+    `RelayData.hbhKey` is removed: the relay forwards the end-to-end SRTP unchanged, so the hop-by-hop key was parsed and never used.
+
+    `InboundVideoFrame` and `InboundVideoRtpPacket` are now the `@zapo-js/voip-media` types, which also carry the optional `senderId` of the stream.
+
+    Decoded call audio is copied for `voip_call_inbound_audio` only while the client has a listener for it, including one added after the call started. On a group call, the SSRCs and SRTP keys of every participant are derived once per call key instead of on every roster change. Call ids come from a cryptographically secure random source, in the same 32-character upper-case hex form. The group-call participant type is `WaCallGroupParticipant`.
+
+### Patch Changes
+
+- Updated dependencies [1ebadd9]
+- Updated dependencies [caeace8]
+    - @zapo-js/voip-media@0.3.0
+
 ## 1.3.0
 
 ### Minor Changes

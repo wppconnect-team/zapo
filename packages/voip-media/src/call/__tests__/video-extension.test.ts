@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { createNoopLogger } from '../../logger.js'
 import { WA_FAST_REMB_ELEMENT_LENGTH, WA_FAST_REMB_EXTENSION_ID } from '../../media/fast-remb.js'
-import { SenderReportSchedule } from '../../media/rtcp.js'
+import { SenderReportSchedule } from '../../media/rtcp-policy.js'
 import { RtpHeader, RtpPacket, RtpSession, WA_RTP_EXTENSION_PROFILE } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import type { WaCallMediaSettings } from '../plan.js'
@@ -47,7 +47,15 @@ const CONTINUATION_EXTENSION = new Uint8Array([
 ])
 
 interface PlaneInternals {
-    videoStreamOpen: boolean
+    outboundVideo: {
+        streamOpen: boolean
+        buildVideoExtension: (
+            keyFrame: boolean,
+            firstPacket: boolean,
+            transportSequence: number,
+            receiverEstimate: number
+        ) => Uint8Array
+    }
     videoRtpSession: RtpSession
     srtpSession: {
         protect: (packet: RtpPacket) => Uint8Array
@@ -62,13 +70,7 @@ interface PlaneInternals {
         setSubscriptionSsrc: (ssrc: number) => void
         resendSubscriptions: () => void
     }
-    receiverEstimateSchedule: SenderReportSchedule
-    buildVideoExtension: (
-        keyFrame: boolean,
-        firstPacket: boolean,
-        transportSequence: number,
-        receiverEstimate: number
-    ) => Uint8Array
+    rtcp: { receiverEstimateSchedule: SenderReportSchedule }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -125,12 +127,12 @@ async function createPlane(
     }
     internals.srtcpContext = { protect: (rtcp) => rtcp }
     internals.videoRtpSession = new RtpSession(SELF_VIDEO_SSRC, H264_PAYLOAD_TYPE)
-    internals.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
+    internals.rtcp.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
     // Video goes out only once media flows: the call accepted, with a leg up.
     if (accepted) {
         await plane.apply({ accepted: true })
         // A stream already running: video is open.
-        internals.videoStreamOpen = true
+        internals.outboundVideo.streamOpen = true
     }
 
     return { plane, sent, internals, videoFrames: 0 }
@@ -241,7 +243,7 @@ test('a packet without the estimate carries the bytes it carried before', async 
     assert.deepEqual(continuation.header.extensionData, CONTINUATION_EXTENSION)
 
     const fresh = await createPlane()
-    const withoutEstimate = fresh.internals.buildVideoExtension(true, true, 0, 0)
+    const withoutEstimate = fresh.internals.outboundVideo.buildVideoExtension(true, true, 0, 0)
     assert.deepEqual(withoutEstimate, EXTENSION_WITHOUT_ESTIMATE)
     fresh.plane.stop()
     harness.plane.stop()
@@ -348,9 +350,9 @@ test('keeps announcing over rtp while the server has turned the rtcp remb off', 
  */
 test('builds every extension in one buffer instead of allocating per packet', async () => {
     const harness = await createPlane()
-    const opening = harness.internals.buildVideoExtension(true, true, 0, 300_000)
-    const continuation = harness.internals.buildVideoExtension(true, false, 1, 0)
-    const again = harness.internals.buildVideoExtension(true, false, 2, 0)
+    const opening = harness.internals.outboundVideo.buildVideoExtension(true, true, 0, 300_000)
+    const continuation = harness.internals.outboundVideo.buildVideoExtension(true, false, 1, 0)
+    const again = harness.internals.outboundVideo.buildVideoExtension(true, false, 2, 0)
 
     assert.equal(opening.buffer, continuation.buffer, 'both are views over the session scratch')
     assert.equal(again, continuation, 'the same shape reuses the same slice')
@@ -371,8 +373,8 @@ test('builds every extension in one buffer instead of allocating per packet', as
  */
 test('zeroes the padding instead of inheriting the previous extension', async () => {
     const harness = await createPlane()
-    harness.internals.buildVideoExtension(true, true, 0xffff, 300_000)
-    const continuation = harness.internals.buildVideoExtension(true, false, 1, 0)
+    harness.internals.outboundVideo.buildVideoExtension(true, true, 0xffff, 300_000)
+    const continuation = harness.internals.outboundVideo.buildVideoExtension(true, false, 1, 0)
 
     assert.deepEqual(continuation, CONTINUATION_EXTENSION)
     harness.plane.stop()

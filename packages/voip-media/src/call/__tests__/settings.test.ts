@@ -5,7 +5,7 @@ import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { readUInt32BE } from '../../bytes.js'
 import { createNoopLogger } from '../../logger.js'
 import { type MLowCodec } from '../../media/mlow-codec.js'
-import { SenderReportSchedule } from '../../media/rtcp.js'
+import { SenderReportSchedule } from '../../media/rtcp-policy.js'
 import { RtpHeader, RtpPacket, RtpSession } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import type { WaCallMediaSettings } from '../plan.js'
@@ -68,7 +68,7 @@ interface PlaneInternals {
         setSubscriptionSsrc: (ssrc: number) => void
         resendSubscriptions: () => void
     }
-    receiverEstimateSchedule: SenderReportSchedule
+    rtcp: { receiverEstimateSchedule: SenderReportSchedule }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -137,7 +137,7 @@ async function createPlane(
     if (mediaType === 'video') {
         internals.videoRtpSession = new RtpSession(SELF_VIDEO_SSRC, 97)
         if (overrideEstimateSchedule) {
-            internals.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
+            internals.rtcp.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
         }
     }
     await plane.apply({ accepted: true })
