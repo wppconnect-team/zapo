@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { writeUInt16BE, writeUInt32BE } from '../../bytes.js'
 import { createNoopLogger } from '../../logger.js'
-import { RtpStreamReception } from '../../media/rtcp.js'
+import { RtpStreamReception } from '../../media/rtp-stream-reception.js'
 import { RtpHeader, RtpPacket } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import type { InboundVideoFrame, InboundVideoRtpPacket } from '../../types.js'
@@ -56,7 +56,7 @@ interface PlaneInternals {
     videoReception: RtpStreamReception
     videoRecvPackets: number
     reedSolomonFecPackets: number
-    inboundVideoStreams: Map<number, { keyFrameReceived: boolean }>
+    inboundVideo: { streams: Map<number, { keyFrameReceived: boolean }> }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -103,7 +103,7 @@ async function createPlane(): Promise<FecHarness> {
 
 /** Whether any inbound video stream got a key frame. */
 function keyFrameReceived(internals: PlaneInternals): boolean {
-    return [...internals.inboundVideoStreams.values()].some((stream) => stream.keyFrameReceived)
+    return [...internals.inboundVideo.streams.values()].some((stream) => stream.keyFrameReceived)
 }
 
 /** An RTP packet as the peer sends it, with marker set to close the frame. */

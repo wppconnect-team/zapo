@@ -8,8 +8,9 @@ import {
     type CapturedMlowPacket,
     WEB_PT121_STREAM
 } from '../../media/__tests__/_mlow-captures.js'
-import { MLowCodec, writeMlowRed } from '../../media/mlow-codec.js'
-import type { RtpStreamReception } from '../../media/rtcp.js'
+import { MLowCodec } from '../../media/mlow-codec.js'
+import { writeMlowRed } from '../../media/mlow-packet.js'
+import type { RtpStreamReception } from '../../media/rtp-stream-reception.js'
 import { RtpHeader, RtpPacket } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import { WaCallMediaPlane } from '../WaCallMediaPlane.js'
@@ -31,9 +32,11 @@ interface PlaneInternals {
         setSubscriptionSsrc: (ssrc: number) => void
         resendSubscriptions: () => void
     }
-    audioReception: RtpStreamReception
     codec: MLowCodec
-    onDecodedAudio: (pcm: Float32Array) => void
+    inboundAudio: {
+        reception: RtpStreamReception
+        onDecodedAudio: (pcm: Float32Array) => void
+    }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -67,7 +70,7 @@ async function createPlane(): Promise<Harness> {
         resendSubscriptions: () => {}
     }
     internals.srtpSession = { unprotect: (data) => RtpPacket.decode(data) }
-    internals.onDecodedAudio = (pcm) => {
+    internals.inboundAudio.onDecodedAudio = (pcm) => {
         played.push(pcm.slice())
     }
     return { plane, internals, played, subscriptions }
@@ -131,7 +134,7 @@ test('a frame that arrives on PT 120 and on PT 121 plays once, the second counte
     assert.equal(codecStats.redundant, packets.length)
     assert.equal(codecStats.late, 0, 'neither numbering reads the other as out of order')
     assert.equal(codecStats.plc + codecStats.fec, 0)
-    const report = harness.internals.audioReception.report(Date.now())
+    const report = harness.internals.inboundAudio.reception.report(Date.now())
     assert.equal(report.ssrc, PEER_AUDIO_SSRC, 'the report stays on the PT 120 stream')
     assert.equal(report.highestSequence, PEER_AUDIO_FIRST_SEQUENCE + packets.length - 1)
     assert.equal(report.packetsLost, 0)
@@ -182,7 +185,7 @@ test('a stream only on PT 121 plays continuously, concealing only the packet it 
     assert.equal(codecStats.late, 0)
     assert.equal(codecStats.redundant, 0)
     assert.deepEqual(harness.subscriptions, [ssrc], 'the PT 121 audio is the peer audio')
-    const report = harness.internals.audioReception.report(Date.now())
+    const report = harness.internals.inboundAudio.reception.report(Date.now())
     assert.equal(report.ssrc, ssrc)
     assert.equal(report.packetsLost, 1)
 })

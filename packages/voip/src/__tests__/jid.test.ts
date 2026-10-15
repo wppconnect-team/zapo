@@ -4,18 +4,17 @@ import { test } from 'node:test'
 import { createNoopLogger } from 'zapo-js'
 import type { BinaryNode } from 'zapo-js/transport'
 
-import { CallInfo } from '../call/call-state.js'
+import { toAddressedJid } from '../call/call-jids.js'
 import { groupSenderDeviceJids } from '../call/group-media-plan.js'
-import { WaCallManager } from '../call/WaCallManager.js'
-import { WaCallMediaSession } from '../call/WaCallMediaSession.js'
 import {
     addressDeviceJid,
     groupParticipantAccountKey,
     isSameDeviceJid,
     toDeviceJid
 } from '../jid.js'
+import { resolvePeerDeviceJids } from '../peer-devices.js'
 import { normalizeParticipantDeviceJids, parseGroupInfoNode } from '../signaling/group-info.js'
-import { CallMediaType, type WaVoipDeps, type WaVoipStores } from '../types.js'
+import type { WaVoipDeps } from '../types.js'
 
 /**
  * `[input, device form, addressed form, account key, parsed device form]`, pinned from the four
@@ -127,28 +126,11 @@ test('the jid helpers keep the output of the normalisers they replaced', () => {
 })
 
 test('every call site derives the same jid as before', async () => {
-    const call = CallInfo.newIncoming(
-        'A'.repeat(32),
-        'peer@lid',
-        'peer@lid',
-        undefined,
-        CallMediaType.Audio
-    )
-    const session = new WaCallMediaSession({
-        deps: { authClient: { getCurrentCredentials: () => ({}) } } as unknown as WaVoipDeps,
-        logger: createNoopLogger(),
-        info: call,
-        createMediaLink: () => ({}) as never,
-        delegate: {} as never
-    }) as unknown as { toAddressedJid(jid: string): string }
-    const manager = new WaCallManager({
-        deps: {
-            signalDeviceSync: {
-                syncDeviceList: () => Promise.reject(new Error('offline'))
-            }
-        } as unknown as WaVoipDeps,
-        stores: {} as WaVoipStores
-    }) as unknown as { resolvePeerDeviceJids(jid: string): Promise<string[]> }
+    const offlineDeps = {
+        signalDeviceSync: {
+            syncDeviceList: () => Promise.reject(new Error('offline'))
+        }
+    } as unknown as WaVoipDeps
 
     for (const [input, device, addressed, , parsed] of TABLE) {
         const composition = {
@@ -156,8 +138,12 @@ test('every call site derives the same jid as before', async () => {
             lastTransactionId: null
         }
         assert.deepEqual(groupSenderDeviceJids(composition, ''), [device], input)
-        assert.equal(session.toAddressedJid(input), addressed, input)
-        assert.equal((await manager.resolvePeerDeviceJids(input))[0], device, input)
+        assert.equal(toAddressedJid(input, createNoopLogger()), addressed, input)
+        assert.equal(
+            (await resolvePeerDeviceJids(offlineDeps, input, createNoopLogger()))[0],
+            device,
+            input
+        )
         assert.equal(
             orNull(() => rosterDeviceJid(input)),
             parsed,
