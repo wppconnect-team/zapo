@@ -339,6 +339,7 @@ function shouldEmitIncomingMessage(message: proto.IMessage): boolean {
         if (
             field === 'senderKeyDistributionMessage' ||
             field === 'fastRatchetKeySenderKeyDistributionMessage' ||
+            field === 'messageContextInfo' ||
             field === '$$unknownFieldCount'
         ) {
             continue
@@ -620,6 +621,7 @@ export async function handleIncomingMessageAck(
         const senderJid = node.attrs.participant ?? node.attrs.from
         let hasSuccessfulDecrypt = false
         let firstDecryptFailure: DecryptEncNodeResult | null = null
+        let skmsgFailure: DecryptEncNodeResult | null = null
         let encCount = 0
         let firstEncType: string | undefined
 
@@ -705,8 +707,12 @@ export async function handleIncomingMessageAck(
                 default:
                     continue
             }
-            if (result.success) hasSuccessfulDecrypt = true
-            else if (!firstDecryptFailure) firstDecryptFailure = result
+            if (result.success) {
+                hasSuccessfulDecrypt = true
+            } else {
+                firstDecryptFailure ??= result
+                if (child.attrs.type === 'skmsg') skmsgFailure ??= result
+            }
         }
 
         if (encCount > 1 && firstEncType === 'skmsg') {
@@ -717,12 +723,13 @@ export async function handleIncomingMessageAck(
                 encCount
             })
         }
-        if (encCount > 0 && !hasSuccessfulDecrypt && firstDecryptFailure) {
+        const decryptFailure = skmsgFailure ?? firstDecryptFailure
+        if (decryptFailure && (!hasSuccessfulDecrypt || skmsgFailure)) {
             await sendRetryReceiptForDecryptFailure(
                 node,
                 options,
-                firstDecryptFailure.error,
-                firstDecryptFailure.encType
+                decryptFailure.error,
+                decryptFailure.encType
             )
             shouldSendStandardReceipt = false
         }
