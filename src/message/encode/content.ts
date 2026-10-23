@@ -430,6 +430,7 @@ function resolveEncMediaTypeFrom(msg: Proto.IMessage): string | null {
     if (msg.groupInviteMessage) return WA_ENC_MEDIA_TYPES.URL
     if (msg.interactiveResponseMessage) return WA_ENC_MEDIA_TYPES.NATIVE_FLOW_RESPONSE
     if (msg.messageHistoryBundle) return WA_ENC_MEDIA_TYPES.GROUP_HISTORY
+    if (msg.albumMessage) return WA_ENC_MEDIA_TYPES.COLLECTION
     if (msg.extendedTextMessage?.matchedText && msg.extendedTextMessage.matchedText.trim() !== '') {
         return WA_ENC_MEDIA_TYPES.URL
     }
