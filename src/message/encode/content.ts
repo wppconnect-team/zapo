@@ -10,7 +10,8 @@ import type {
     WaSendPollVoteMessage,
     WaSendReactionMessage,
     WaSendRevokeMessage,
-    WaSendTextMessage
+    WaSendTextMessage,
+    WaSendTypedMessage
 } from '@message/types'
 import { proto, type Proto } from '@proto'
 import {
@@ -171,6 +172,21 @@ export function isSendEventResponseMessage(
         content.type === 'event-response' &&
         'event' in content &&
         'response' in content
+    )
+}
+
+export function isSendTypedMessage(content: unknown): content is WaSendTypedMessage {
+    return (
+        isSendTextMessage(content) ||
+        isSendReactionMessage(content) ||
+        isSendRevokeMessage(content) ||
+        isSendPinMessage(content) ||
+        isSendKeepMessage(content) ||
+        isSendPollMessage(content) ||
+        isSendPollVoteMessage(content) ||
+        isSendEventMessage(content) ||
+        isSendEventResponseMessage(content) ||
+        isSendMediaMessage(content)
     )
 }
 
@@ -438,7 +454,12 @@ function resolveEncMediaTypeFrom(msg: Proto.IMessage): string | null {
 }
 
 /** Companion business node kind for list and native-flow messages. */
-export type WaButtonAddonKind = 'list' | 'interactive' | 'payment_info' | 'order_details'
+export type WaButtonAddonKind =
+    | 'list'
+    | 'interactive'
+    | 'payment_info'
+    | 'order_details'
+    | 'form_message'
 
 export function resolveButtonAddonKind(message: Proto.IMessage): WaButtonAddonKind | null {
     return resolveButtonAddonKindFrom(unwrapMessage(message))
@@ -450,6 +471,7 @@ function resolveNativeFlowAddonKind(
     const firstButtonName = nativeFlow.buttons?.[0]?.name
     if (firstButtonName === 'payment_info') return 'payment_info'
     if (firstButtonName === 'review_and_pay') return 'order_details'
+    if (firstButtonName === 'form_message') return 'form_message'
     return 'interactive'
 }
 
