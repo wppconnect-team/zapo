@@ -8,7 +8,10 @@ export type {
     WaDownloadMediaOptions,
     WaGroupHistoryBundleEvent,
     WaHistorySyncChunkEvent,
+    WaHistorySyncChunkRef,
+    WaHistorySyncItem,
     WaHistorySyncOptions,
+    WaHistorySyncSink,
     WaWriteBehindOptions
 } from '@client/types'
 export type { WaClientPluginContext, WaClientPluginDefinition } from '@client/plugins'
@@ -17,6 +20,7 @@ export type {
     WaMessageCoordinator,
     WaShareGroupHistoryInput,
     WaShareGroupHistoryResult,
+    WaSyncSignalSessionOptions,
     WaUploadMediaOptions,
     WaUploadMediaType
 } from '@client/coordinators/WaMessageCoordinator'
