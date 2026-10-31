@@ -1,93 +1,51 @@
-<!-- wppconnect-official-brand -->
+**English** | [Português (Brasil)](./README.pt-BR.md)
+
 <p align="center">
-  <a href="https://wppconnect-team.github.io/">
+  <a href="https://wppconnect.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://wppconnect-team.github.io/brand/wppconnect-dark.png" />
       <img src="https://wppconnect-team.github.io/brand/wppconnect-light.png" alt="WPPConnect" width="220" height="121" />
     </picture>
   </a>
 </p>
-<!-- /wppconnect-official-brand -->
 
 # Zapo
 
-WPPConnect organization fork of [vinikjkkj/zapo](https://github.com/vinikjkkj/zapo).
+Build WhatsApp Web protocol integrations with a TypeScript socket client.
 
-<p align="center">
-  <strong>High-performance TypeScript implementation of the WhatsApp Web protocol.</strong><br />
-  Built for high-scalability workloads, multi-session operation, and full user configurability.
-</p>
+A WPPConnect Team fork in the WPPConnect ecosystem. Original project credits and license are preserved.
 
-<p align="center">
-  <a href="https://www.npmjs.com/package/zapo-js"><img alt="npm version" src="https://img.shields.io/npm/v/zapo-js?color=CB3837" /></a>
-  <a href="https://www.npmjs.com/package/zapo-js"><img alt="npm package size" src="https://img.shields.io/npm/unpacked-size/zapo-js?label=package%20size&color=2F855A" /></a>
-  <a href="https://github.com/sponsors/vinikjkkj"><img alt="sponsor" src="https://img.shields.io/badge/sponsor-vinikjkkj-EA4AAA?logo=githubsponsors&logoColor=white" /></a>
-  <img alt="node version" src="https://img.shields.io/badge/node-%3E%3D20.9.0-339933" />
-  <img alt="language" src="https://img.shields.io/badge/language-TypeScript-3178C6" />
-  <img alt="focus" src="https://img.shields.io/badge/focus-high--scale%20%2B%20multi--session-0A7EA4" />
-</p>
+[Getting started](#getting-started) | [Documentation](#documentation) | [Contributing](#contributing) | [Support WPPConnect](#support-the-project)
 
-<p align="center">
-  📚 <strong>Documentation:</strong> <a href="https://zapo.to/">zapo.to</a> ·
-  🛠 <strong>Contributing:</strong> <a href="CONTRIBUTING.md">CONTRIBUTING.md</a> ·
-  💛 <strong>Sponsor:</strong> <a href="https://github.com/sponsors/vinikjkkj">GitHub Sponsors</a>
-</p>
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE) [![npm version](https://img.shields.io/npm/v/zapo-js)](https://www.npmjs.com/package/zapo-js) [![CI](https://github.com/wppconnect-team/zapo/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/wppconnect-team/zapo/actions/workflows/ci.yml) [![Open Collective](https://img.shields.io/badge/Open%20Collective-WPPConnect-blue)](https://opencollective.com/wppconnect)
 
----
+## Overview
 
-## Stability Notice
+For developers who need explicit session, storage and transport control. This is the WPPConnect Team integration fork of [vinikjkkj/zapo](https://github.com/vinikjkkj/zapo). The core package is `zapo-js`; optional modules are published as `@zapo-js/*`. npm releases and zapo.to are upstream resources and may differ from this fork.
 
-> `zapo-js` is stable as of `1.0.0`. The public API follows SemVer:
-> breaking changes ship only in a major release; minors add features,
-> patches fix bugs.
+## Features
 
-## Install
+- Core client, typed events, messages, groups, app-state and protocol primitives.
+- Optional SQLite, Redis, PostgreSQL, MySQL and MongoDB stores.
+- Optional media tools, native crypto accelerator, calls, test server and development MCP server.
 
-```bash
-npm install zapo-js
+## Getting started
+
+Requires Node.js **>=20.9.0** and npm **10** for source development; optional peers may have additional requirements. The upstream package flow is:
+
+```sh
+npm install zapo-js @zapo-js/store-sqlite better-sqlite3 qrcode-terminal
 ```
 
-Zero mandatory runtime dependencies. Pick the optional packages you need
-on top: a persistent store, the media processor for thumbnails /
-voice-note metadata, and the native crypto accelerator.
+Save as `index.mjs`, run `node index.mjs` and scan the terminal QR from WhatsApp Linked devices. An authorized test contact can send `ping` to receive `pong`. The example persists all required auth/Signal domains. Keep the `.auth` database private.
 
-```bash
-# Persistent store - choose one
-npm install @zapo-js/store-sqlite better-sqlite3
-# or @zapo-js/store-redis ioredis
-# or @zapo-js/store-postgres pg
-# or @zapo-js/store-mysql mysql2
-# or @zapo-js/store-mongo mongodb
-
-# Optional - thumbnails + waveforms + voice-note normalization
-npm install @zapo-js/media-utils sharp
-# plus a system `ffmpeg` + `ffprobe` on PATH (see media-utils README)
-
-# Optional - Rust crypto accelerator, no code change required
-npm install @zapo-js/native
-
-# Optional - structured logging
-npm install pino pino-pretty
-```
-
-`@zapo-js/native` is picked up automatically once installed: the core
-resolves it on first use and falls back to the JS implementation when it is
-absent, so nothing else changes. It accelerates the two primitives that
-dominate the messaging hot path, X25519 ECDH and XEdDSA sign / verify. The
-published build is the WASM one (`ZAPO_NATIVE_BACKEND=auto` tries the NAPI
-addon first, then WASM); the compiled NAPI addon is not on npm yet and has
-to be built from `packages/native`. Set `ZAPO_NATIVE_BACKEND=js` to opt out.
-
-## Quick Start
-
-```ts
+```javascript
+import qrcode from 'qrcode-terminal'
 import { ConsoleLogger, createStore, WaClient } from 'zapo-js'
 import { createSqliteStore } from '@zapo-js/store-sqlite'
 
 const store = createStore({
-    backends: {
-        sqlite: createSqliteStore({ path: '.auth/state.sqlite' })
-    },
+    backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
     providers: {
         auth: 'sqlite',
         signal: 'sqlite',
@@ -97,102 +55,98 @@ const store = createStore({
         senderKey: 'sqlite',
         appState: 'sqlite',
         privacyToken: 'sqlite',
-        messages: 'sqlite', // 'none' to skip the message archive
-        threads: 'sqlite', // 'none' to skip
-        contacts: 'sqlite' // 'none' to skip
+        messages: 'sqlite',
+        threads: 'sqlite',
+        contacts: 'sqlite'
     }
 })
-
 const client = new WaClient({ store, sessionId: 'default' }, new ConsoleLogger('info'))
-
-client.on('auth_qr', ({ qr }) => {
-    console.log('scan this:', qr)
-})
-
-client.on('auth_paired', ({ credentials }) => {
-    console.log('paired as', credentials.meJid)
-})
-
+client.on('auth_qr', ({ qr }) => qrcode.generate(qr, { small: true }))
 client.on('message', async (event) => {
     if (event.message?.conversation === 'ping') {
         await client.message.send(event.key.remoteJid, 'pong')
     }
 })
-
 await client.connect()
 ```
 
-That's the minimum to pair, listen for messages, and reply. For everything
-else - sending media, reactions, polls, groups, newsletters, app-state
-mutations, business profile, events catalog, store providers, the typed
-event map, and the architectural reasoning - read the guides at
-**[zapo.to](https://zapo.to/)**.
+To exercise this fork instead of upstream npm releases:
 
-## Packages
+```sh
+git clone https://github.com/wppconnect-team/zapo.git
+cd zapo
+npm ci
+npm run build
+npm run example
+```
 
-The core lives at the repo root (`zapo-js`). Optional packages live in
-[`packages/`](packages/) and ship under the `@zapo-js/*` scope. Install
-only what you need.
+## Configuration
 
-| Package                                              | Peer dependency                                                                       | Purpose                                                                                                                                          |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`@zapo-js/store-sqlite`](packages/store-sqlite)     | `better-sqlite3`                                                                      | SQLite persistent store (single-process bots, dev sessions, small-to-medium prod).                                                               |
-| [`@zapo-js/store-redis`](packages/store-redis)       | `ioredis`                                                                             | Redis-backed store with native TTL eviction.                                                                                                     |
-| [`@zapo-js/store-mongo`](packages/store-mongo)       | `mongodb`                                                                             | MongoDB-backed store with TTL-index eviction.                                                                                                    |
-| [`@zapo-js/store-mysql`](packages/store-mysql)       | `mysql2`                                                                              | MySQL / MariaDB-backed store with background cleanup poller.                                                                                     |
-| [`@zapo-js/store-postgres`](packages/store-postgres) | `pg`                                                                                  | PostgreSQL-backed store with background cleanup poller.                                                                                          |
-| [`@zapo-js/media-utils`](packages/media-utils)       | `sharp` + `file-type` + `ffmpeg`                                                      | `WaMediaProcessor`: thumbnails, waveforms, voice-note normalization.                                                                             |
-| [`@zapo-js/native`](packages/native)                 | (none)                                                                                | Rust crypto accelerator for the messaging hot path (X25519 ECDH, XEdDSA sign / verify). Auto-detected once installed; ships as a WASM build.     |
-| [`@zapo-js/voip`](packages/voip)                     | `@roamhq/wrtc` + `libmlow-wasm-fork`                                                  | `client.voip` plugin for calls: MLow/WASM codec, SRTP, STUN, WebRTC/SCTP relay transport.                                                        |
-| [`@zapo-js/voip-media`](packages/voip-media)         | `libmlow-wasm-fork` (optional, to carry media) + `@roamhq/wrtc` (optional, Node host) | Call media plane with no Node or `zapo-js` dependency, so it runs in the browser: relay transport, STUN, SRTP, RTP/RTCP, MLow codec.             |
-| [`@zapo-js/wam`](packages/wam)                       | (none)                                                                                | `client.wam` plugin emitting the client-side WAM telemetry batches WA Web sends, for wire parity and anti-fingerprinting.                        |
-| [`@zapo-js/fake-server`](packages/fake-server)       | (none)                                                                                | In-process fake WhatsApp Web server for end-to-end testing.                                                                                      |
-| [`@zapo-js/mcp-server`](packages/mcp-server)         | `@modelcontextprotocol/sdk`                                                           | **Dev-only.** MCP server exposing multi-session `WaClient`s as dynamic tools for an LLM agent (Claude Code / Cursor / etc.). Not for production. |
-
-Each package's README has the install + config + integration notes.
+[examples/example.ts](examples/example.ts) provides the runnable flow. Each store/media/call module documents its own peers in [packages](packages/). Media processing may need `sharp`, `ffmpeg` and `ffprobe`. `ZAPO_NATIVE_BACKEND=js` disables the optional native accelerator; the published accelerator is WASM, while NAPI needs a local build. `WaClient` has no automatic reconnect: handle connection-close events explicitly. The MCP server is for development, not production. Upstream documents SemVer from 1.0.0; review fork diffs when pinning a revision.
 
 ## Documentation
 
-- **[zapo.to](https://zapo.to/)** - guides, full API reference, examples,
-  protocol notes ([llms.txt](https://zapo.to/llms.txt) index or
-  [llms-full.txt](https://zapo.to/llms-full.txt) for LLM context)
-- **[`vinikjkkj/zapo-docs`](https://github.com/vinikjkkj/zapo-docs)** -
-  source of zapo.to (open issues/PRs there for doc fixes)
-- **Per-package READMEs** under [`packages/`](packages/) - one per
-  optional package
-- **[`AGENTS.md`](AGENTS.md)** - architecture spec + coding rules
-  (contributor-facing)
+- [Upstream API and guides](https://zapo.to/)
+- [Documentation source](https://github.com/vinikjkkj/zapo-docs)
+- [Optional packages](./packages/)
+- [Retained technical details and acknowledgments](documentation/readme-reference.md)
+
+## WPPConnect ecosystem
+
+| Project                                                     | Purpose                                                        | When to use it                               |
+| ----------------------------------------------------------- | -------------------------------------------------------------- | -------------------------------------------- |
+| [WPPConnect](https://github.com/wppconnect-team/wppconnect) | Control WhatsApp Web from Node.js applications.                | Embed automation in a Node.js application.   |
+| [Baileys](https://github.com/wppconnect-team/baileys)       | Use the WhatsApp Web protocol from TypeScript over WebSockets. | Evaluate a TypeScript WebSocket client fork. |
+
+## Support the project
+
+Support original development through [vinikjkkj on GitHub Sponsors](https://github.com/sponsors/vinikjkkj), preserved from [.github/FUNDING.yml](.github/FUNDING.yml). Support for WPPConnect below funds this fork's ecosystem maintenance separately.
+
+WPPConnect is maintained by an open-source community. Your support helps fund maintenance, infrastructure, documentation, and the people working on the ecosystem.
+
+If WPPConnect helps your project or business, consider making a one-time contribution or becoming a recurring supporter.
+
+**[Support WPPConnect on Open Collective](https://opencollective.com/wppconnect)**
+
+Contributions are voluntary. See the official page for current financial information. You can also help with code, tests, documentation, translations and well-described issue reports.
 
 ## Contributing
 
-Pull requests are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for
-setup, repo layout, CI, release flow, and the conventions PRs must follow.
+Contributions of code, tests, examples, documentation and translations are welcome. For larger changes, discuss the approach in an issue first. Include the project/runtime versions, a minimal reproduction and sanitized logs when reporting a problem. Update both `README.md` and `README.pt-BR.md` in the same change when installation, configuration, features, examples, licensing or funding changes.
 
-Contributors also agree to the [Code of Conduct](CODE_OF_CONDUCT.md),
-which includes an **AI-Assisted Contributions** policy covering
-disclosure, human ownership, and the rule against bundle-hallucinated
-protocol claims.
+Read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Security
+Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
-Found a vulnerability in the crypto, auth, or Signal layer? Please
-**do not open a public issue**. Report it privately via
-[GitHub Security Advisories](https://github.com/vinikjkkj/zapo/security/advisories/new)
-or email `contact@vinicius.email`. Scope, response window, and
-disclosure timeline are documented in [`SECURITY.md`](SECURITY.md).
+Read [AGENTS.md](AGENTS.md).
+
+After installing the development dependencies, use the repository checks relevant to your change:
+
+```sh
+npm run lint
+npm run format:check
+npm test
+npm run typecheck:all
+```
+
+Account-dependent examples and tests require separate validation with an authorized test account. Never attach credentials or session files to an issue.
+
+## Community and support
+
+Use [repository issues](https://github.com/wppconnect-team/zapo/issues) for reproducible bugs and feature proposals. For usage questions, join the community through the official channels:
+
+- [Discord](https://discord.gg/JU5JGGKGNG)
+- [Telegram](https://t.me/wppconnect)
+- [YouTube](https://www.youtube.com/c/wppconnect)
+
+Use the upstream [documentation repository](https://github.com/vinikjkkj/zapo-docs) for guide fixes. Follow [SECURITY.md](SECURITY.md) privately for crypto/auth vulnerabilities and the [Code of Conduct](CODE_OF_CONDUCT.md) for AI-assisted contributions.
+
+This project is independent and is not affiliated with or endorsed by WhatsApp or Meta. Follow applicable terms and obtain authorization for account and messaging operations.
 
 ## License
 
-[MIT](LICENSE) © vinikjkkj
+[MIT License (MIT)](./LICENSE).
 
-## Support the Project
+Copyright (c) 2026 vinikjkkj <contact@vinicius.email>.
 
-If `zapo` is useful in your production or study setup, you can support
-ongoing development on GitHub Sponsors:
-[github.com/sponsors/vinikjkkj](https://github.com/sponsors/vinikjkkj).
-
-## Disclaimer
-
-This project is an independent implementation for engineering and
-interoperability research. It is not affiliated with or endorsed by
-WhatsApp.
+The original legal document and existing copyright notices are preserved. Third-party components retain their own terms.
