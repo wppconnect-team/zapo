@@ -1,10 +1,17 @@
+<!-- wppconnect-official-brand -->
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vinikjkkj/zapo/master/.github/assets/logo.png" />
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/vinikjkkj/zapo/master/.github/assets/logo-light.png" />
-    <img src="https://raw.githubusercontent.com/vinikjkkj/zapo/master/.github/assets/logo-light.png" alt="zapo" width="400" />
-  </picture>
+  <a href="https://wppconnect-team.github.io/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://wppconnect-team.github.io/brand/wppconnect-dark.png" />
+      <img src="https://wppconnect-team.github.io/brand/wppconnect-light.png" alt="WPPConnect" width="220" height="121" />
+    </picture>
+  </a>
 </p>
+<!-- /wppconnect-official-brand -->
+
+# Zapo
+
+WPPConnect organization fork of [vinikjkkj/zapo](https://github.com/vinikjkkj/zapo).
 
 <p align="center">
   <strong>High-performance TypeScript implementation of the WhatsApp Web protocol.</strong><br />
