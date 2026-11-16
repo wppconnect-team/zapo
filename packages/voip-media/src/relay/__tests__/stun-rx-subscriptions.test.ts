@@ -153,7 +153,10 @@ test('a change of rx subscriptions is re-announced on open legs, a repeat is not
     await dial(relay)
     const initial = rxOfAllocates(sent)
     assert.ok(initial.length >= 1, 'the relay announced its initial allocation')
-    assert.ok(initial.every((rx) => rx === null), 'no 0x4021 until one is set')
+    assert.ok(
+        initial.every((rx) => rx === null),
+        'no 0x4021 until one is set'
+    )
     sent.length = 0
 
     const rx = buildRxSubscriptions([{ pid: 2, quality: 2 }])
